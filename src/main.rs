@@ -5,6 +5,7 @@ use elf::endian::AnyEndian;
 use std::collections::BTreeMap;
 
 #[derive(Clone)]
+#[allow(dead_code)]
 enum RegisterRule {
     Uninitialized,
     Undefined,
@@ -31,6 +32,7 @@ impl std::fmt::Debug for RegisterRule {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 enum CFARule {
     Uninitialized,
     RegOffset(usize, i64), // (register, offset)
@@ -63,6 +65,7 @@ impl std::fmt::Debug for CFT {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct Cie {
     version: u8,
     caf: u64,   // code alignment factor
@@ -175,25 +178,34 @@ fn read_leb128_u(data: &[u8], offset: &mut usize) -> Result<u64> {
     read_leb128_impl(data, offset, false)
 }
 
-fn read_encoded_ptr(data: &[u8], encoding: u8, dwarf64: bool, offset: &mut usize)
+fn read_encoded_ptr(data: &[u8], encoding: u8, pc: u64, dwarf64: bool, offset: &mut usize)
     -> Result<u64>
 {
     if encoding == 0x00 {
         // DW_EH_PE_absptr
-        read_uint(data, dwarf64, offset)
+        return read_uint(data, dwarf64, offset);
+    }
+    let off = match encoding & 0x0f {
+        0x01 => read_leb128_u(data, offset)?, // DW_EH_PE_uleb128
+        0x02 => read_u16(data, offset)? as u64, // DW_EH_PE_udata2
+        0x03 => read_u32(data, offset)? as u64, // DW_EH_PE_udata4
+        0x04 => read_u64(data, offset)?, // DW_EH_PE_udata8
+        0x09 => read_leb128_s(data, offset)? as u64, // DW_EH_PE_uleb128
+        0x0a => read_u16(data, offset)? as i16 as i64 as u64, // DW_EH_PE_udata2
+        0x0b => read_u32(data, offset)? as i32 as i64 as u64, // DW_EH_PE_udata4
+        0x0c => read_u64(data, offset)?, // DW_EH_PE_udata8
+        _ => bail!("unsupported pointer encoding: {:#x}", encoding),
+    };
+    if encoding & 0x70 == 0x10 {
+        // PC-relative
+        Ok((pc as i64 + off as i64) as u64)
     } else {
-        match encoding & 0x07 {
-            0x01 => read_leb128_u(data, offset), // DW_EH_PE_uleb128
-            0x02 => read_u16(data, offset).map(|v| v as u64), // DW_EH_PE_udata2
-            0x03 => read_u32(data, offset).map(|v| v as u64), // DW_EH_PE_udata4
-            0x04 => read_u64(data, offset), // DW_EH_PE_udata8
-            _ => bail!("unsupported pointer encoding: {:#x}", encoding),
-        }
+        Ok(off)
     }
 }
 
 // see https://www.airs.com/blog/archives/460
-fn parse_eh_cie(data: &[u8], dwarf64: bool) -> Result<Cie> {
+fn parse_eh_cie(data: &[u8], pc: u64, dwarf64: bool) -> Result<Cie> {
     let mut offset = 0;
     let version = read_u8(data, &mut offset)?;
     if version != 1 && version != 3 {
@@ -232,7 +244,7 @@ fn parse_eh_cie(data: &[u8], dwarf64: bool) -> Result<Cie> {
                 }
                 'P' => {
                     let p_enc = read_u8(data, &mut offset)?;
-                    let p_ptr = read_encoded_ptr(data, p_enc, dwarf64, &mut offset)?;
+                    let p_ptr = read_encoded_ptr(data, p_enc, pc, dwarf64, &mut offset)?;
                     personality = Some((p_enc, p_ptr));
                 }
                 _ => {
@@ -425,19 +437,23 @@ fn execute_fde(fde: &Fde, cie: &Cie) -> Result<()> {
     println!("FDE Instructions: {:x?}", fde.instructions);
     execute_instructions(&cie.initial_cfa, &cie, &mut cft)?;
     execute_instructions(&fde.instructions, &cie, &mut cft)?;
-    println!("End at {:x}", fde.initial_location + fde.address_range - 1);
+    if cft.loc >= fde.initial_location + fde.address_range {
+        bail!("FDE instructions advanced location beyond address range");
+    }
+    println!("End at {:x} of range {:x} - {:x}", cft.loc,
+        fde.initial_location, fde.initial_location + fde.address_range - 1);
 
     Ok(())
 }
 
-fn parse_debug_cie(data: &[u8], dwarf64: bool, offset: &mut usize) -> Result<()> {
+fn parse_debug_cie(_data: &[u8], _dwarf64: bool, _offset: &mut usize) -> Result<()> {
     unimplemented!("debug_frame CIE parsing not implemented yet");
 }
 
-fn parse_fde(data: &[u8], dwarf64: bool, cie: &Cie) -> Result<Fde> {
+fn parse_fde(data: &[u8], pc: u64, dwarf64: bool, cie: &Cie) -> Result<Fde> {
     let mut offset = 0;
-    let initial_location = read_encoded_ptr(data, cie.fde_encoding, dwarf64, &mut offset)?;
-    let address_range = read_encoded_ptr(data, cie.fde_encoding, dwarf64, &mut offset)?;
+    let initial_location = read_encoded_ptr(data, cie.fde_encoding, pc, dwarf64, &mut offset)?;
+    let address_range = read_encoded_ptr(data, cie.fde_encoding, 0, dwarf64, &mut offset)?;
     if cie.aug_z {
         let aug_data_len = read_leb128_u(data, &mut offset)? as usize;
         offset += aug_data_len;
@@ -500,9 +516,10 @@ fn main() -> Result<()> {
             .expect("could not read frame id");
         println!("frame length: {} id {}", frame_len, id);
         // on debug_frame, this is different
+        let pc = offset as u64 + eh_hdr.sh_addr;
         if id == 0 {
             // CIE
-            let cie = parse_eh_cie(&eh[offset..frame_end], dwarf64)
+            let cie = parse_eh_cie(&eh[offset..frame_end], pc, dwarf64)
                 .expect("could not parse CIE");
             println!("parsed eh CIE: {:?}, id_offset {}", cie, id_offset);
             cies.insert(id_offset as u64, cie);
@@ -515,7 +532,7 @@ fn main() -> Result<()> {
             println!("parsing eh FDE with CIE id {}, offset {}", id, offset);
             let cie_addr = offset as u64 - id;
             let cie = cies.get(&cie_addr).expect("could not find CIE for FDE");
-            let fde = parse_fde(&eh[offset..frame_end], dwarf64, &cie)
+            let fde = parse_fde(&eh[offset..frame_end], pc, dwarf64, &cie)
                 .expect("could not parse FDE");
             println!("parsed eh FDE: {:?}", fde);
             execute_fde(&fde, &cie)?;
