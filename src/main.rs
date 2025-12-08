@@ -4,6 +4,84 @@ use elf::ElfStream;
 use elf::endian::AnyEndian;
 use std::collections::BTreeMap;
 
+#[derive(Clone)]
+enum RegisterRule {
+    Uninitialized,
+    Undefined,
+    SameValue,
+    Offset(i64),    // offset from CFA
+    ValOffset(i64),
+    Register(u64),
+    Expression(Vec<u8>),
+    ValExpression(Vec<u8>),
+}
+impl std::fmt::Debug for RegisterRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegisterRule::Uninitialized => write!(f, "-"),
+            RegisterRule::Undefined => write!(f, "u"),
+            RegisterRule::SameValue => write!(f, "="),
+            RegisterRule::Offset(off) => write!(f, "o{}", off),
+            RegisterRule::ValOffset(off) => write!(f, "vo{}", off),
+            RegisterRule::Register(reg) => write!(f, "r{}", reg),
+            RegisterRule::Expression(_) => write!(f, "expr"),
+            RegisterRule::ValExpression(_) => write!(f, "vexpr"),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum CFARule {
+    Uninitialized,
+    RegOffset(usize, i64), // (register, offset)
+    Expression(Vec<u8>),
+}
+
+impl std::fmt::Debug for CFARule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CFARule::Uninitialized => write!(f, "-"),
+            CFARule::RegOffset(reg, off) => write!(f, "r{}+{}", reg, off),
+            CFARule::Expression(_) => write!(f, "expr"),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CFT {
+    loc: u64,
+    cfa: CFARule,
+    rules: Vec<RegisterRule>,
+    arg_size: u64,
+}
+
+impl std::fmt::Debug for CFT {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "loc {:#x}, cfa {:?} rules {:?} arg_size {}",
+            self.loc, self.cfa, self.rules, self.arg_size)
+    }
+}
+
+#[derive(Debug)]
+struct Cie {
+    version: u8,
+    caf: u64,   // code alignment factor
+    daf: i64,   // data alignment factor
+    rar: u64,   // return address register
+    aug_z: bool,
+    lsda_encoding: Option<u8>,
+    fde_encoding: u8,
+    personality: Option<(u8, u64)>,
+    initial_cfa: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct Fde {
+    initial_location: u64,
+    address_range: u64,
+    instructions: Vec<u8>,
+}
+
 fn read_uint(data: &[u8], dwarf64: bool, offset: &mut usize) -> Result<u64> {
     if dwarf64 {
         read_u64(data, offset)
@@ -114,38 +192,6 @@ fn read_encoded_ptr(data: &[u8], encoding: u8, dwarf64: bool, offset: &mut usize
     }
 }
 
-#[derive(Debug, Clone)]
-enum RegisterRule {
-    Uninitialized,
-    Undefined,
-    SameValue,
-    Offset(i64),    // offset from CFA
-    ValOffset(i64),
-    Register(u64),
-    Expression(Vec<u8>),
-    ValExpression(Vec<u8>),
-}
-
-#[derive(Debug, Clone)]
-enum CFARule {
-    Uninitialized,
-    RegOffset(usize, i64), // (register, offset)
-    Expression(Vec<u8>),
-}
-
-#[derive(Debug)]
-struct Cie {
-    version: u8,
-    caf: u64,   // code alignment factor
-    daf: i64,   // data alignment factor
-    rar: u64,   // return address register
-    aug_z: bool,
-    lsda_encoding: Option<u8>,
-    fde_encoding: u8,
-    personality: Option<(u8, u64)>,
-    initial_cfa: Vec<u8>,
-}
-
 // see https://www.airs.com/blog/archives/460
 fn parse_eh_cie(data: &[u8], dwarf64: bool) -> Result<Cie> {
     let mut offset = 0;
@@ -210,14 +256,6 @@ fn parse_eh_cie(data: &[u8], dwarf64: bool) -> Result<Cie> {
         personality,
         initial_cfa: data[offset..].into(),
     })
-}
-
-#[derive(Debug, Clone)]
-struct CFT {
-    loc: u64,
-    cfa: CFARule,
-    rules: Vec<RegisterRule>,
-    arg_size: u64,
 }
 
 fn submit_row(cft: &CFT) {
@@ -396,13 +434,6 @@ fn parse_debug_cie(data: &[u8], dwarf64: bool, offset: &mut usize) -> Result<()>
     unimplemented!("debug_frame CIE parsing not implemented yet");
 }
 
-#[derive(Debug)]
-struct Fde {
-    initial_location: u64,
-    address_range: u64,
-    instructions: Vec<u8>,
-}
-
 fn parse_fde(data: &[u8], dwarf64: bool, cie: &Cie) -> Result<Fde> {
     let mut offset = 0;
     let initial_location = read_encoded_ptr(data, cie.fde_encoding, dwarf64, &mut offset)?;
@@ -467,6 +498,7 @@ fn main() -> Result<()> {
         let id_offset = offset;
         let id = read_uint(&eh, dwarf64, &mut offset)
             .expect("could not read frame id");
+        println!("frame length: {} id {}", frame_len, id);
         // on debug_frame, this is different
         if id == 0 {
             // CIE
@@ -488,7 +520,6 @@ fn main() -> Result<()> {
             println!("parsed eh FDE: {:?}", fde);
             execute_fde(&fde, &cie)?;
         }
-        println!("frame length: {} id {}", frame_len, id);
         if offset > frame_end {
             bail!("consume more than the frame");
         }
