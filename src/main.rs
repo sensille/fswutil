@@ -5,20 +5,14 @@ use elf::endian::AnyEndian;
 use std::collections::BTreeMap;
 
 fn read_uint(data: &[u8], dwarf64: bool, offset: &mut usize) -> Result<u64> {
-    let size = if dwarf64 { 8 } else { 4 };
-    if data.len() < *offset + size {
-        bail!("not enough data to read int of size {}", size);
-    }
-    let val = if dwarf64 {
-        u64::from_le_bytes(data[*offset..*offset + 8].try_into()?)
+    if dwarf64 {
+        read_u64(data, offset)
     } else {
-        u32::from_le_bytes(data[*offset..*offset + 4].try_into()?) as u64
-    };
-    *offset += size;
-
-    Ok(val)
+        read_u32(data, offset).map(|v| v as u64)
+    }
 }
 
+// TODO: generics
 fn read_u8(data: &[u8], offset: &mut usize) -> Result<u8> {
     if data.len() < *offset + 1 {
         bail!("not enough data to read u8");
@@ -33,7 +27,7 @@ fn read_u16(data: &[u8], offset: &mut usize) -> Result<u16> {
         bail!("not enough data to read u16");
     }
     let val = u16::from_le_bytes(data[*offset..*offset + 2].try_into()?);
-    *offset += 1;
+    *offset += 2;
     Ok(val)
 }
 
@@ -43,6 +37,15 @@ fn read_u32(data: &[u8], offset: &mut usize) -> Result<u32> {
     }
     let val = u32::from_le_bytes(data[*offset..*offset + 4].try_into()?);
     *offset += 4;
+    Ok(val)
+}
+
+fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64> {
+    if data.len() < *offset + 8 {
+        bail!("not enough data to read u64");
+    }
+    let val = u64::from_le_bytes(data[*offset..*offset + 4].try_into()?);
+    *offset += 8;
     Ok(val)
 }
 
@@ -70,14 +73,17 @@ fn read_leb128_impl(data: &[u8], offset: &mut usize, sign_extend: bool) -> Resul
         byte = data[*offset];
         *offset += 1;
         result |= ((byte & 0x7f) as u64) << shift;
+        shift += 7;
         if (byte & 0x80) == 0 {
             break;
         }
-        shift += 7;
     }
     // sign extend if necessary
-    if sign_extend && shift < 64 && (byte & 0x40) != 0 {
-        result |= !0 << shift;
+    if sign_extend {
+        println!("sign extending LEB128 value: shift {} byte {:x} result {:x}", shift, byte, result);
+        if shift < 64 && (byte & 0x40) != 0 {
+            result |= (!0u64) << shift;
+        }
     }
     Ok(result)
 }
@@ -91,6 +97,42 @@ fn read_leb128_u(data: &[u8], offset: &mut usize) -> Result<u64> {
     read_leb128_impl(data, offset, false)
 }
 
+fn read_encoded_ptr(data: &[u8], encoding: u8, dwarf64: bool, offset: &mut usize)
+    -> Result<u64>
+{
+    if encoding == 0x00 {
+        // DW_EH_PE_absptr
+        read_uint(data, dwarf64, offset)
+    } else {
+        match encoding & 0x07 {
+            0x01 => read_leb128_u(data, offset), // DW_EH_PE_uleb128
+            0x02 => read_u16(data, offset).map(|v| v as u64), // DW_EH_PE_udata2
+            0x03 => read_u32(data, offset).map(|v| v as u64), // DW_EH_PE_udata4
+            0x04 => read_u64(data, offset), // DW_EH_PE_udata8
+            _ => bail!("unsupported pointer encoding: {:#x}", encoding),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RegisterRule {
+    Uninitialized,
+    Undefined,
+    SameValue,
+    Offset(i64),    // offset from CFA
+    ValOffset(i64),
+    Register(u64),
+    Expression(Vec<u8>),
+    ValExpression(Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+enum CFARule {
+    Uninitialized,
+    RegOffset(usize, i64), // (register, offset)
+    Expression(Vec<u8>),
+}
+
 #[derive(Debug)]
 struct Cie {
     version: u8,
@@ -100,11 +142,12 @@ struct Cie {
     aug_z: bool,
     lsda_encoding: Option<u8>,
     fde_encoding: u8,
+    personality: Option<(u8, u64)>,
     initial_cfa: Vec<u8>,
 }
 
 // see https://www.airs.com/blog/archives/460
-fn parse_eh_cie(data: &[u8]) -> Result<Cie> {
+fn parse_eh_cie(data: &[u8], dwarf64: bool) -> Result<Cie> {
     let mut offset = 0;
     let version = read_u8(data, &mut offset)?;
     if version != 1 && version != 3 {
@@ -119,28 +162,41 @@ fn parse_eh_cie(data: &[u8]) -> Result<Cie> {
         read_leb128_u(data, &mut offset)?
     };
     let mut aug_z = false;
+    let mut lsda_encoding = None;
+    let mut fde_encoding = 0x00; // absptr
+    let mut personality = None;
     if augmentation.starts_with("z") {
         // skip augmentation data for now
         let aug_data_len = read_leb128_u(data, &mut offset)? as usize;
         println!("CIE augmentation data length: {}", aug_data_len);
-        offset += aug_data_len;
         aug_z = true;
-    }
-    let mut lsda_encoding = None;
-    if augmentation.contains("L") {
-        // skip LSDA encoding
-        lsda_encoding = Some(read_u8(data, &mut offset)?);
-    }
-    let fde_encoding = None;
-    if augmentation.contains("R") {
-        //fde_encoding = Some(read_u8(data, &mut offset)?);
-    }
-    if augmentation.contains("S") {
-        bail!("signal frame indicator not supported yet");
-    }
-    if augmentation.contains("P") {
-        let _personality = read_leb128_u(data, &mut offset)?;
-        bail!("personality routine not supported yet");
+        let aug_end = offset + aug_data_len;
+        for c in augmentation.chars().skip(1) {
+            match c {
+                'L' => {
+                    lsda_encoding = Some(read_u8(data, &mut offset)?);
+                }
+                'R' => {
+                    // fde address encoding
+                    fde_encoding = read_u8(data, &mut offset)?;
+                }
+                'S' => {
+                    // signal frame indicator
+                    bail!("signal frame indicator not supported yet");
+                }
+                'P' => {
+                    let p_enc = read_u8(data, &mut offset)?;
+                    let p_ptr = read_encoded_ptr(data, p_enc, dwarf64, &mut offset)?;
+                    personality = Some((p_enc, p_ptr));
+                }
+                _ => {
+                    bail!("unsupported CIE augmentation character: {}", c);
+                }
+            }
+        }
+        if offset != aug_end {
+            bail!("did not consume all augmentation data");
+        }
     }
 
     Ok(Cie {
@@ -150,22 +206,32 @@ fn parse_eh_cie(data: &[u8]) -> Result<Cie> {
         rar,
         aug_z,
         lsda_encoding,
-        fde_encoding: fde_encoding.unwrap_or(0),
+        fde_encoding,
+        personality,
         initial_cfa: data[offset..].into(),
     })
 }
 
+#[derive(Debug, Clone)]
 struct CFT {
     loc: u64,
-    cfa_offset: i64,
-    regs: Vec<i64>,
+    cfa: CFARule,
+    rules: Vec<RegisterRule>,
+    arg_size: u64,
+}
+
+fn submit_row(cft: &CFT) {
+    println!("CFT Row: loc = {:#x} cfa = {:?} rules = {:?}",
+        cft.loc, cft.cfa, cft.rules);
 }
 
 fn execute_instructions(instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result<()> {
     println!("Executing instructions: {:x?}", instructions);
     let mut offset = 0;
+    let mut cft_stack: Vec<CFT> = Vec::new();
     while offset < instructions.len() {
         let instr = read_u8(instructions, &mut offset)?;
+        println!("Instruction: {:#x}", instr);
         match instr {
             0x00 => {
                 // DW_CFA_nop
@@ -173,61 +239,129 @@ fn execute_instructions(instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result
             }
             0x01 => {
                 // DW_CFA_set_loc
-                if cie.fde_encoding != 0 {
-                    bail!("DW_CFA_set_loc with unsupported FDE encoding {}", cie.fde_encoding);
-                }
+                submit_row(&cft);
                 cft.loc = read_uint(instructions, false, &mut offset)?;
                 println!("DW_CFA_set_loc to {:#x}", cft.loc);
             }
             0x02 => {
                 // DW_CFA_advance_loc1
+                submit_row(&cft);
                 let delta = read_u8(instructions, &mut offset)? as u64;
                 println!("DW_CFA_advance_loc1 by {}", delta);
-                cft.loc += delta;
+                cft.loc += delta * cie.caf;
             }
             0x03 => {
                 // DW_CFA_advance_loc2
+                submit_row(&cft);
                 let delta = read_u16(instructions, &mut offset)? as u64;
                 println!("DW_CFA_advance_loc2 by {}", delta);
-                cft.loc += delta;
+                cft.loc += delta * cie.caf;
             }
             0x04 => {
                 // DW_CFA_advance_loc4
+                submit_row(&cft);
                 let delta = read_u32(instructions, &mut offset)? as u64;
                 println!("DW_CFA_advance_loc4 by {}", delta);
-                cft.loc += delta;
+                cft.loc += delta * cie.caf;
+            }
+            0x07 => {
+                // DW_CFA_undefined
+                let reg = read_leb128_u(instructions, &mut offset)? as usize;
+                if reg >= cft.rules.len() {
+                    bail!("DW_CFA_offset: register {} out of bounds", reg);
+                }
+                cft.rules[reg] = RegisterRule::Undefined;
+                println!("DW_CFA_def_undefined: reg {}", reg);
+            }
+            0x0a => {
+                // DW_CFA_remember_state
+                cft_stack.push(cft.clone());
+                println!("DW_CFA_remember_state");
+            }
+            0x0b => {
+                // DW_CFA_restore_state
+                if cft_stack.is_empty() {
+                    bail!("DW_CFA_restore_state: no state to restore");
+                }
+                let prev_cft = cft_stack.pop().unwrap();
+                *cft = prev_cft;
+                println!("DW_CFA_restore_state");
             }
             0x0c => {
                 // DW_CFA_def_cfa
                 let reg = read_leb128_u(instructions, &mut offset)? as usize;
                 let offset_val = read_leb128_u(instructions, &mut offset)?;
-                if reg > cft.regs.len() {
+                if reg > cft.rules.len() {
                     bail!("DW_CFA_def_cfa: register {} out of bounds", reg);
                 }
-                cft.regs[reg] = offset_val as i64;
+                cft.cfa = CFARule::RegOffset(reg, offset_val as i64);
                 println!("DW_CFA_def_cfa: reg {}, offset {}", reg, offset_val);
+            }
+            0x0d => {
+                // DW_CFA_def_cfa_register
+                let reg = read_leb128_u(instructions, &mut offset)? as usize;
+                if reg > cft.rules.len() {
+                    bail!("DW_CFA_def_cfa: register {} out of bounds", reg);
+                }
+                if let CFARule::RegOffset(_, offset_val) = cft.cfa {
+                    cft.cfa = CFARule::RegOffset(reg, offset_val);
+                } else {
+                    bail!("DW_CFA_def_cfa_register: CFA not set to RegOffset");
+                }
+                println!("DW_CFA_def_cfa_register: reg {}", reg);
+            }
+            0x0e => {
+                // DW_CFA_def_cfa_offset
+                let offset_val = read_leb128_u(instructions, &mut offset)?;
+                if let CFARule::RegOffset(reg, _) = cft.cfa {
+                    cft.cfa = CFARule::RegOffset(reg, offset_val as i64);
+                } else {
+                    bail!("DW_CFA_def_cfa_offset: CFA register not set");
+                }
+                println!("DW_CFA_def_cfa_offset: offset {}", offset_val);
+            }
+            0x0f => {
+                // DW_CFA_def_cfa_expression
+                let len = read_leb128_u(instructions, &mut offset)? as usize;
+                if instructions.len() < offset + len {
+                    bail!("DW_CFA_def_cfa_expression: not enough data for expression, need {}, have {}",
+                        len, instructions.len() - offset);
+                }
+                cft.cfa = CFARule::Expression(instructions[offset..offset + len]
+                    .into());
+                offset += len;
+                println!("DW_CFA_def_cfa_register: expr");
+            }
+            0x2e => {
+                // DW_CFA_GNU_args_size
+                let size = read_leb128_u(instructions, &mut offset)?;
+                cft.arg_size = size;
+                println!("DW_CFA_GNU_args_size: size {}", size);
             }
             0x40..=0x7f => {
                 // DW_CFA_advance_loc
+                submit_row(&cft);
                 let delta = (instr & 0x3f) as u64;
                 println!("DW_CFA_advance_loc by {}", delta);
+                cft.loc += delta;
             }
             0x80..=0xbf => {
                 // DW_CFA_offset
                 let reg = (instr & 0x3f) as usize;
-                if reg >= cft.regs.len() {
+                if reg >= cft.rules.len() {
                     bail!("DW_CFA_offset: register {} out of bounds", reg);
                 }
                 let offset_val = read_leb128_u(instructions, &mut offset)? as i64;
-                println!("DW_CFA_offset: reg {}, offset {}", reg, offset_val);
-                cft.regs[reg] = offset_val * cie.daf;
+                println!("DW_CFA_offset: reg {}, offset {}", reg, offset_val * cie.daf);
+                cft.rules[reg] = RegisterRule::Offset(offset_val * cie.daf);
             }
             0xc0..=0xff => {
                 // DW_CFA_restore
                 let reg = (instr & 0x3f) as usize;
-                if reg >= cft.regs.len() {
+                if reg >= cft.rules.len() {
                     bail!("DW_CFA_restore: register {} out of bounds", reg);
                 }
+                println!("DW_CFA_restore: reg {}", reg);
             }
             _ => {
                 bail!("unsupported DWARF instruction: {:#x}", instr);
@@ -246,18 +380,20 @@ fn execute_fde(fde: &Fde, cie: &Cie) -> Result<()> {
     // For simplicity, we just print the instructions here.
     let mut cft = CFT {
         loc: fde.initial_location,
-        cfa_offset: 0,
-        regs: vec![0; 17],
+        cfa: CFARule::Uninitialized,
+        rules: vec![RegisterRule::Uninitialized; 17],
+        arg_size: 0,
     };
     println!("FDE Instructions: {:x?}", fde.instructions);
     execute_instructions(&cie.initial_cfa, &cie, &mut cft)?;
     execute_instructions(&fde.instructions, &cie, &mut cft)?;
+    println!("End at {:x}", fde.initial_location + fde.address_range - 1);
 
     Ok(())
 }
 
 fn parse_debug_cie(data: &[u8], dwarf64: bool, offset: &mut usize) -> Result<()> {
-    Ok(())
+    unimplemented!("debug_frame CIE parsing not implemented yet");
 }
 
 #[derive(Debug)]
@@ -269,11 +405,8 @@ struct Fde {
 
 fn parse_fde(data: &[u8], dwarf64: bool, cie: &Cie) -> Result<Fde> {
     let mut offset = 0;
-    if cie.fde_encoding != 0 {
-        bail!("FDE encoding {} not supported", cie.fde_encoding);
-    }
-    let initial_location = read_uint(data, dwarf64, &mut offset)?;
-    let address_range = read_uint(data, dwarf64, &mut offset)?;
+    let initial_location = read_encoded_ptr(data, cie.fde_encoding, dwarf64, &mut offset)?;
+    let address_range = read_encoded_ptr(data, cie.fde_encoding, dwarf64, &mut offset)?;
     if cie.aug_z {
         let aug_data_len = read_leb128_u(data, &mut offset)? as usize;
         offset += aug_data_len;
@@ -324,6 +457,11 @@ fn main() -> Result<()> {
     while offset < eh.len() {
         let frame_len = read_uint(&eh, dwarf64, &mut offset)
             .expect("could not read frame length");
+        println!("frame: {:x?}", &eh[offset..offset + frame_len as usize]);
+        if frame_len == 0 {
+            println!("reached end of .eh_frame");
+            break;
+        }
         // CIE or FDE?
         let frame_end = offset + frame_len as usize;
         let id_offset = offset;
@@ -332,7 +470,7 @@ fn main() -> Result<()> {
         // on debug_frame, this is different
         if id == 0 {
             // CIE
-            let cie = parse_eh_cie(&eh[offset..frame_end])
+            let cie = parse_eh_cie(&eh[offset..frame_end], dwarf64)
                 .expect("could not parse CIE");
             println!("parsed eh CIE: {:?}, id_offset {}", cie, id_offset);
             cies.insert(id_offset as u64, cie);
@@ -351,6 +489,9 @@ fn main() -> Result<()> {
             execute_fde(&fde, &cie)?;
         }
         println!("frame length: {} id {}", frame_len, id);
+        if offset > frame_end {
+            bail!("consume more than the frame");
+        }
         offset = frame_end;
     }
 
