@@ -90,7 +90,7 @@ struct Fde {
 #[derive(Debug)]
 struct Fsw {
     dwarf64: bool,
-    entries: BTreeMap<u64, CFT>,
+    entries: BTreeMap<u64, Option<CFT>>,
 }
 
 fn read_uint(data: &[u8], dwarf64: bool, offset: &mut usize) -> Result<u64> {
@@ -282,10 +282,21 @@ fn parse_eh_cie(data: &[u8], pc: u64, dwarf64: bool) -> Result<Cie> {
 fn submit_row(fsw: &mut Fsw, cft: &CFT) {
     println!("CFT Row: loc = {:#x} cfa = {:?} rules = {:?}",
         cft.loc, cft.cfa, cft.rules);
-    let old = fsw.entries.insert(cft.loc, cft.clone());
-    if old.is_some() {
+    let old = fsw.entries.insert(cft.loc, Some(cft.clone()));
+    if let Some(Some(_)) = old {
         panic!("Warning: overwriting existing CFT entry at loc {:#x}", cft.loc);
     }
+}
+
+fn submit_end(fsw: &mut Fsw, loc: u64) {
+    println!("CFT End Row: loc = {:#x}", loc);
+    let e = fsw.entries.get(&loc);
+    // don't overwrite existing (non-end) entries
+    if let Some(Some(_)) = e {
+        debug!("overwriting existing CFT entry at loc {:#x}", loc);
+        return;
+    }
+    fsw.entries.insert(loc, None);
 }
 
 fn execute_instructions(fsw: &mut Fsw, instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result<()> {
@@ -461,6 +472,7 @@ fn execute_fde(fsw: &mut Fsw, fde: &Fde, cie: &Cie) -> Result<()> {
         bail!("FDE instructions advanced location beyond address range");
     }
     submit_row(fsw, &cft);
+    submit_end(fsw, fde.initial_location + fde.address_range);
     println!("End at {:x} of range {:x} - {:x}", cft.loc,
         fde.initial_location, fde.initial_location + fde.address_range - 1);
 
@@ -602,7 +614,7 @@ fn main() -> Result<()> {
             break;
         };
         let e = fsw.entries.range(..=(rip - map_offset)).rev().next();
-        let Some((_, cft)) = e else {
+        let Some((_, Some(cft))) = e else {
             println!("Stack walk: PC {:#x}, no entry found, stopping", rip - map_offset);
             break;
         };
