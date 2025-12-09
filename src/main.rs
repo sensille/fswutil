@@ -1,8 +1,10 @@
 use std::fs::File;
+use std::io::Read;
 use anyhow::{Result, bail};
 use elf::ElfStream;
 use elf::endian::AnyEndian;
 use std::collections::BTreeMap;
+use log::debug;
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -85,6 +87,12 @@ struct Fde {
     instructions: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct Fsw {
+    dwarf64: bool,
+    entries: BTreeMap<u64, CFT>,
+}
+
 fn read_uint(data: &[u8], dwarf64: bool, offset: &mut usize) -> Result<u64> {
     if dwarf64 {
         read_u64(data, offset)
@@ -161,7 +169,8 @@ fn read_leb128_impl(data: &[u8], offset: &mut usize, sign_extend: bool) -> Resul
     }
     // sign extend if necessary
     if sign_extend {
-        println!("sign extending LEB128 value: shift {} byte {:x} result {:x}", shift, byte, result);
+        debug!("sign extending LEB128 value: shift {} byte {:x} result {:x}",
+            shift, byte, result);
         if shift < 64 && (byte & 0x40) != 0 {
             result |= (!0u64) << shift;
         }
@@ -270,48 +279,55 @@ fn parse_eh_cie(data: &[u8], pc: u64, dwarf64: bool) -> Result<Cie> {
     })
 }
 
-fn submit_row(cft: &CFT) {
+fn submit_row(fsw: &mut Fsw, cft: &CFT) {
     println!("CFT Row: loc = {:#x} cfa = {:?} rules = {:?}",
         cft.loc, cft.cfa, cft.rules);
+    let old = fsw.entries.insert(cft.loc, cft.clone());
+    if old.is_some() {
+        panic!("Warning: overwriting existing CFT entry at loc {:#x}", cft.loc);
+    }
 }
 
-fn execute_instructions(instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result<()> {
-    println!("Executing instructions: {:x?}", instructions);
+fn execute_instructions(fsw: &mut Fsw, instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result<()> {
+    debug!("Executing instructions: {:x?}", instructions);
     let mut offset = 0;
     let mut cft_stack: Vec<CFT> = Vec::new();
+    let initial = cft.clone();
     while offset < instructions.len() {
         let instr = read_u8(instructions, &mut offset)?;
-        println!("Instruction: {:#x}", instr);
+        debug!("Instruction: {:#x}", instr);
         match instr {
             0x00 => {
                 // DW_CFA_nop
-                println!("DW_CFA_nop");
+                debug!("DW_CFA_nop");
             }
             0x01 => {
                 // DW_CFA_set_loc
-                submit_row(&cft);
-                cft.loc = read_uint(instructions, false, &mut offset)?;
-                println!("DW_CFA_set_loc to {:#x}", cft.loc);
+                submit_row(fsw, &cft);
+                //cft.loc = read_uint(instructions, false, &mut offset)?;
+                cft.loc = read_encoded_ptr(instructions, cie.fde_encoding,
+                    0, fsw.dwarf64, &mut offset)?;
+                debug!("DW_CFA_set_loc to {:#x}", cft.loc);
             }
             0x02 => {
                 // DW_CFA_advance_loc1
-                submit_row(&cft);
+                submit_row(fsw, &cft);
                 let delta = read_u8(instructions, &mut offset)? as u64;
-                println!("DW_CFA_advance_loc1 by {}", delta);
+                debug!("DW_CFA_advance_loc1 by {}", delta);
                 cft.loc += delta * cie.caf;
             }
             0x03 => {
                 // DW_CFA_advance_loc2
-                submit_row(&cft);
+                submit_row(fsw, &cft);
                 let delta = read_u16(instructions, &mut offset)? as u64;
-                println!("DW_CFA_advance_loc2 by {}", delta);
+                debug!("DW_CFA_advance_loc2 by {}", delta);
                 cft.loc += delta * cie.caf;
             }
             0x04 => {
                 // DW_CFA_advance_loc4
-                submit_row(&cft);
+                submit_row(fsw, &cft);
                 let delta = read_u32(instructions, &mut offset)? as u64;
-                println!("DW_CFA_advance_loc4 by {}", delta);
+                debug!("DW_CFA_advance_loc4 by {}", delta);
                 cft.loc += delta * cie.caf;
             }
             0x07 => {
@@ -321,21 +337,23 @@ fn execute_instructions(instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result
                     bail!("DW_CFA_offset: register {} out of bounds", reg);
                 }
                 cft.rules[reg] = RegisterRule::Undefined;
-                println!("DW_CFA_def_undefined: reg {}", reg);
+                debug!("DW_CFA_def_undefined: reg {}", reg);
             }
             0x0a => {
                 // DW_CFA_remember_state
                 cft_stack.push(cft.clone());
-                println!("DW_CFA_remember_state");
+                debug!("DW_CFA_remember_state");
             }
             0x0b => {
                 // DW_CFA_restore_state
                 if cft_stack.is_empty() {
                     bail!("DW_CFA_restore_state: no state to restore");
                 }
-                let prev_cft = cft_stack.pop().unwrap();
+                let mut prev_cft = cft_stack.pop().unwrap();
+                prev_cft.loc = cft.loc; // keep current loc
+                //prev_cft.cfa = cft.cfa.clone(); // keep current cfa
                 *cft = prev_cft;
-                println!("DW_CFA_restore_state");
+                debug!("DW_CFA_restore_state");
             }
             0x0c => {
                 // DW_CFA_def_cfa
@@ -345,7 +363,7 @@ fn execute_instructions(instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result
                     bail!("DW_CFA_def_cfa: register {} out of bounds", reg);
                 }
                 cft.cfa = CFARule::RegOffset(reg, offset_val as i64);
-                println!("DW_CFA_def_cfa: reg {}, offset {}", reg, offset_val);
+                debug!("DW_CFA_def_cfa: reg {}, offset {}", reg, offset_val);
             }
             0x0d => {
                 // DW_CFA_def_cfa_register
@@ -358,7 +376,7 @@ fn execute_instructions(instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result
                 } else {
                     bail!("DW_CFA_def_cfa_register: CFA not set to RegOffset");
                 }
-                println!("DW_CFA_def_cfa_register: reg {}", reg);
+                debug!("DW_CFA_def_cfa_register: reg {}", reg);
             }
             0x0e => {
                 // DW_CFA_def_cfa_offset
@@ -368,7 +386,7 @@ fn execute_instructions(instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result
                 } else {
                     bail!("DW_CFA_def_cfa_offset: CFA register not set");
                 }
-                println!("DW_CFA_def_cfa_offset: offset {}", offset_val);
+                debug!("DW_CFA_def_cfa_offset: offset {}", offset_val);
             }
             0x0f => {
                 // DW_CFA_def_cfa_expression
@@ -380,19 +398,19 @@ fn execute_instructions(instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result
                 cft.cfa = CFARule::Expression(instructions[offset..offset + len]
                     .into());
                 offset += len;
-                println!("DW_CFA_def_cfa_register: expr");
+                debug!("DW_CFA_def_cfa_register: expr");
             }
             0x2e => {
                 // DW_CFA_GNU_args_size
                 let size = read_leb128_u(instructions, &mut offset)?;
                 cft.arg_size = size;
-                println!("DW_CFA_GNU_args_size: size {}", size);
+                debug!("DW_CFA_GNU_args_size: size {}", size);
             }
             0x40..=0x7f => {
                 // DW_CFA_advance_loc
-                submit_row(&cft);
+                submit_row(fsw, &cft);
                 let delta = (instr & 0x3f) as u64;
-                println!("DW_CFA_advance_loc by {}", delta);
+                debug!("DW_CFA_advance_loc by {}", delta);
                 cft.loc += delta;
             }
             0x80..=0xbf => {
@@ -402,7 +420,7 @@ fn execute_instructions(instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result
                     bail!("DW_CFA_offset: register {} out of bounds", reg);
                 }
                 let offset_val = read_leb128_u(instructions, &mut offset)? as i64;
-                println!("DW_CFA_offset: reg {}, offset {}", reg, offset_val * cie.daf);
+                debug!("DW_CFA_offset: reg {}, offset {}", reg, offset_val * cie.daf);
                 cft.rules[reg] = RegisterRule::Offset(offset_val * cie.daf);
             }
             0xc0..=0xff => {
@@ -411,7 +429,9 @@ fn execute_instructions(instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result
                 if reg >= cft.rules.len() {
                     bail!("DW_CFA_restore: register {} out of bounds", reg);
                 }
-                println!("DW_CFA_restore: reg {}", reg);
+                // XXX differs between eh_frame and debug_frame
+                cft.rules[reg] = initial.rules[reg].clone();
+                debug!("DW_CFA_restore: reg {}", reg);
             }
             _ => {
                 bail!("unsupported DWARF instruction: {:#x}", instr);
@@ -422,7 +442,7 @@ fn execute_instructions(instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result
     Ok(())
 }
 
-fn execute_fde(fde: &Fde, cie: &Cie) -> Result<()> {
+fn execute_fde(fsw: &mut Fsw, fde: &Fde, cie: &Cie) -> Result<()> {
     println!(
         "Executing FDE: initial_location = {:#x}, address_range = {:#x}",
         fde.initial_location, fde.address_range
@@ -434,12 +454,13 @@ fn execute_fde(fde: &Fde, cie: &Cie) -> Result<()> {
         rules: vec![RegisterRule::Uninitialized; 17],
         arg_size: 0,
     };
-    println!("FDE Instructions: {:x?}", fde.instructions);
-    execute_instructions(&cie.initial_cfa, &cie, &mut cft)?;
-    execute_instructions(&fde.instructions, &cie, &mut cft)?;
+    debug!("FDE Instructions: {:x?}", fde.instructions);
+    execute_instructions(fsw, &cie.initial_cfa, &cie, &mut cft)?;
+    execute_instructions(fsw, &fde.instructions, &cie, &mut cft)?;
     if cft.loc >= fde.initial_location + fde.address_range {
         bail!("FDE instructions advanced location beyond address range");
     }
+    submit_row(fsw, &cft);
     println!("End at {:x} of range {:x} - {:x}", cft.loc,
         fde.initial_location, fde.initial_location + fde.address_range - 1);
 
@@ -476,7 +497,7 @@ fn main() -> Result<()> {
         .expect("section table should be parseable")
         .expect("no .eh_frame section in file");
 
-    println!(".eh_frame section header: {:#?}", &eh_hdr);
+    debug!(".eh_frame section header: {:#?}", &eh_hdr);
 
     // XXX TODO: read as stream
     let (eh, comp) = elf
@@ -487,8 +508,8 @@ fn main() -> Result<()> {
         bail!(".eh_frame is compressed, cannot decompress");
     }
 
-    println!("compression: {:?}", comp);
-    println!("eh: {:x?}", &eh[..64]);
+    debug!("compression: {:?}", comp);
+    debug!("eh: {:x?}", &eh[..64]);
 
     if eh.len() < 4 {
         bail!(".eh_frame section too small");
@@ -496,15 +517,19 @@ fn main() -> Result<()> {
     let mut offset = 0;
     let mut dwarf64 = false;
     if eh[0..4] == [0xff, 0xff, 0xff, 0xff] {
-        println!(".eh_frame section uses 64-bit DWARF format");
+        debug!(".eh_frame section uses 64-bit DWARF format");
         dwarf64 = true;
         offset = 4;
     }
     let mut cies = BTreeMap::new();
+    let mut fsw = Fsw {
+        dwarf64,
+        entries: BTreeMap::new(),
+    };
     while offset < eh.len() {
         let frame_len = read_uint(&eh, dwarf64, &mut offset)
             .expect("could not read frame length");
-        println!("frame: {:x?}", &eh[offset..offset + frame_len as usize]);
+        debug!("frame: {:x?}", &eh[offset..offset + frame_len as usize]);
         if frame_len == 0 {
             println!("reached end of .eh_frame");
             break;
@@ -514,14 +539,14 @@ fn main() -> Result<()> {
         let id_offset = offset;
         let id = read_uint(&eh, dwarf64, &mut offset)
             .expect("could not read frame id");
-        println!("frame length: {} id {}", frame_len, id);
+        debug!("frame length: {} id {}", frame_len, id);
         // on debug_frame, this is different
         let pc = offset as u64 + eh_hdr.sh_addr;
         if id == 0 {
             // CIE
             let cie = parse_eh_cie(&eh[offset..frame_end], pc, dwarf64)
                 .expect("could not parse CIE");
-            println!("parsed eh CIE: {:?}, id_offset {}", cie, id_offset);
+            debug!("parsed eh CIE: {:?}, id_offset {}", cie, id_offset);
             cies.insert(id_offset as u64, cie);
         } else if id == 0xffffffff {
             // debug_frame CIE
@@ -529,18 +554,112 @@ fn main() -> Result<()> {
                 .expect("could not parse debug_frame CIE");
         } else {
             // FDE
-            println!("parsing eh FDE with CIE id {}, offset {}", id, offset);
+            debug!("parsing eh FDE with CIE id {}, offset {}", id, offset);
             let cie_addr = offset as u64 - id;
             let cie = cies.get(&cie_addr).expect("could not find CIE for FDE");
             let fde = parse_fde(&eh[offset..frame_end], pc, dwarf64, &cie)
                 .expect("could not parse FDE");
-            println!("parsed eh FDE: {:?}", fde);
-            execute_fde(&fde, &cie)?;
+            debug!("parsed eh FDE: {:?}", fde);
+            execute_fde(&mut fsw, &fde, &cie)?;
         }
         if offset > frame_end {
             bail!("consume more than the frame");
         }
         offset = frame_end;
+    }
+
+    // Do a test stack walk
+    let mut stack_file = File::open("./stack.dump")?;
+    let mut stack_data = Vec::new();
+    stack_file.read_to_end(&mut stack_data)?;
+    let regs = vec![
+        0x0u64,   // rax
+        0x55c897e7fd50,  // rdx
+        0x55c803185790, // rcx
+        0x55c897e7fd78, // rbx
+        0x55c86af87200, // rsi
+        0x55c8592fe000, // rdi
+        0x7fb998af8030, // rbp
+        0x7fb998af7a48, // rsp
+        0x55c897e7fd78, // r8
+        0x20,           // r9
+        0x1000,         // r10
+        0x55c86af87200, // r11
+        0x0,            // r12
+        0x55c858d260a0, // r13
+        0xfffffffffffffffe, // r14
+        0x55c86af87200, // r15
+        0x55c802509ac0, // rip
+    ];
+    let mut regs = regs.into_iter().map(|v| Some(v)).collect::<Vec<Option<u64>>>();
+
+    let map_offset = 0x55c80220d000 - 0x377000;
+    let stack_start = regs[7].unwrap(); // rsp
+
+    loop {
+        let Some(rip) = regs[16] else {
+            println!("Stack walk: PC is None, stopping");
+            break;
+        };
+        let e = fsw.entries.range(..=(rip - map_offset)).rev().next();
+        let Some((_, cft)) = e else {
+            println!("Stack walk: PC {:#x}, no entry found, stopping", rip - map_offset);
+            break;
+        };
+        println!("Stack walk: PC {:#x}, found entry: {:?}", rip - map_offset, e);
+
+        // compute CFA
+        let cfa = match cft.cfa {
+            CFARule::Uninitialized => {
+                println!("Stack walk: CFA uninitialized, stopping");
+                break;
+            }
+            CFARule::Expression(_) => {
+                println!("Stack walk: CFA expression not supported, stopping");
+                break;
+            }
+            CFARule::RegOffset(r, o) => {
+                let reg_val = match regs[r] {
+                    Some(v) => v,
+                    None => {
+                        println!("Stack walk: CFA register r{} is None, stopping", r);
+                        break;
+                    }
+                };
+                let cfa = (reg_val as i64 + o) as u64;
+                println!("  CFA = r{} ({:#x}) + {} = {:#x}", r, reg_val, o, cfa);
+                cfa
+            }
+        };
+
+        let _old_regs = regs.clone();
+
+        // unwind stack pointer
+        regs[7] = Some(cfa);
+
+        for reg in 0..regs.len() {
+            match &cft.rules[reg] {
+                RegisterRule::Uninitialized|RegisterRule::SameValue => {
+                    // register is unchanged
+                }
+                RegisterRule::Undefined => {
+                    regs[reg] = None;
+                }
+                RegisterRule::Offset(off) => {
+                    let addr = (cfa as i64 + *off) as u64;
+                    let val = u64::from_le_bytes(stack_data[(addr - stack_start) as usize ..
+                        ((addr - stack_start) + 8) as usize].try_into().unwrap());
+                    println!("  r{}: at addr {:#x} value {:#x}", reg, addr, val);
+                    regs[reg] = Some(val);
+                }
+                // XXX use old_regs for register to register copy
+                _ => {
+                    panic!("unsupported register rule for stack walk: {:?}", cft.rules[reg]);
+                }
+            }
+        }
+        println!("  next PC from r16: {:x?}", regs[16]);
+        println!("  regs: {:x?}", regs);
     }
 
     Ok(())
