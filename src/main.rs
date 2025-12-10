@@ -1,10 +1,10 @@
 use std::fs::File;
-use std::io::Read;
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, Context};
 use elf::ElfStream;
 use elf::endian::AnyEndian;
 use std::collections::BTreeMap;
-use log::debug;
+use log::{debug, info, warn};
+use std::io::BufRead;
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[allow(dead_code)]
@@ -77,6 +77,7 @@ struct Cie {
     lsda_encoding: Option<u8>,
     fde_encoding: u8,
     personality: Option<(u8, u64)>,
+    signal_frame: bool,
     initial_cfa: Vec<u8>,
 }
 
@@ -235,10 +236,11 @@ fn parse_eh_cie(data: &[u8], pc: u64, dwarf64: bool) -> Result<Cie> {
     let mut lsda_encoding = None;
     let mut fde_encoding = 0x00; // absptr
     let mut personality = None;
+    let mut signal_frame = false;
     if augmentation.starts_with("z") {
         // skip augmentation data for now
         let aug_data_len = read_leb128_u(data, &mut offset)? as usize;
-        println!("CIE augmentation data length: {}", aug_data_len);
+        debug!("CIE augmentation data length: {}", aug_data_len);
         aug_z = true;
         let aug_end = offset + aug_data_len;
         for c in augmentation.chars().skip(1) {
@@ -252,7 +254,8 @@ fn parse_eh_cie(data: &[u8], pc: u64, dwarf64: bool) -> Result<Cie> {
                 }
                 'S' => {
                     // signal frame indicator
-                    bail!("signal frame indicator not supported yet");
+                    debug!("signal frame indicator found");
+                    signal_frame = true;
                 }
                 'P' => {
                     let p_enc = read_u8(data, &mut offset)?;
@@ -278,12 +281,13 @@ fn parse_eh_cie(data: &[u8], pc: u64, dwarf64: bool) -> Result<Cie> {
         lsda_encoding,
         fde_encoding,
         personality,
+        signal_frame,
         initial_cfa: data[offset..].into(),
     })
 }
 
 fn submit_row(fsw: &mut Fsw, cft: &CFT) {
-    println!("CFT Row: loc = {:#x} cfa = {:?} rules = {:?}",
+    info!("CFT Row: loc = {:#x} cfa = {:?} rules = {:?}",
         cft.loc, cft.cfa, cft.rules);
     let mut canon_cft = cft.clone();
     canon_cft.loc = 0; // ignore loc for canonicalization
@@ -304,7 +308,7 @@ fn submit_row(fsw: &mut Fsw, cft: &CFT) {
 }
 
 fn submit_end(fsw: &mut Fsw, loc: u64) {
-    println!("CFT End Row: loc = {:#x}", loc);
+    info!("CFT End Row: loc = {:#x}", loc);
     let e = fsw.entries.get(&loc);
     // don't overwrite existing (non-end) entries
     if let Some(Some(_)) = e {
@@ -360,10 +364,20 @@ fn execute_instructions(fsw: &mut Fsw, instructions: &[u8], cie: &Cie, cft: &mut
                 // DW_CFA_undefined
                 let reg = read_leb128_u(instructions, &mut offset)? as usize;
                 if reg >= cft.rules.len() {
-                    bail!("DW_CFA_offset: register {} out of bounds", reg);
+                    bail!("DW_CFA_undefined: register {} out of bounds", reg);
                 }
                 cft.rules[reg] = RegisterRule::Undefined;
                 debug!("DW_CFA_def_undefined: reg {}", reg);
+            }
+            0x09 => {
+                // DW_CFA_register
+                let reg = read_leb128_u(instructions, &mut offset)? as usize;
+                let offset = read_leb128_u(instructions, &mut offset)? as u64;
+                if reg >= cft.rules.len() {
+                    bail!("DW_CFA_register: register {} out of bounds", reg);
+                }
+                cft.rules[reg] = RegisterRule::Register(offset);
+                debug!("DW_CFA_register: reg {}, reg {}", reg, offset);
             }
             0x0a => {
                 // DW_CFA_remember_state
@@ -426,6 +440,29 @@ fn execute_instructions(fsw: &mut Fsw, instructions: &[u8], cie: &Cie, cft: &mut
                 offset += len;
                 debug!("DW_CFA_def_cfa_register: expr");
             }
+            0x10 => {
+                // DW_CFA_expression
+                let reg = read_leb128_u(instructions, &mut offset)? as usize;
+                let len = read_leb128_u(instructions, &mut offset)? as usize;
+                if instructions.len() < offset + len {
+                    bail!("DW_CFA_expression: not enough data for expression, need {}, have {}",
+                        len, instructions.len() - offset);
+                }
+                cft.rules[reg] = RegisterRule::Expression(instructions[offset..offset + len]
+                    .into());
+                offset += len;
+                debug!("DW_CFA_expression: reg {}, expr", reg);
+            }
+            0x11 => {
+                // DW_CFA_offset_extended_sf
+                let reg = read_leb128_u(instructions, &mut offset)? as usize;
+                if reg >= cft.rules.len() {
+                    bail!("DW_CFA_offset_extended: register {} out of bounds", reg);
+                }
+                let offset = read_leb128_s(instructions, &mut offset)? as i64;
+                debug!("DW_CFA_offset_extended_sf: reg {}, offset {}", reg, offset * cie.daf);
+                cft.rules[reg] = RegisterRule::Offset(offset * cie.daf);
+            }
             0x2e => {
                 // DW_CFA_GNU_args_size
                 let size = read_leb128_u(instructions, &mut offset)?;
@@ -469,7 +506,7 @@ fn execute_instructions(fsw: &mut Fsw, instructions: &[u8], cie: &Cie, cft: &mut
 }
 
 fn execute_fde(fsw: &mut Fsw, fde: &Fde, cie: &Cie) -> Result<()> {
-    println!(
+    info!(
         "Executing FDE: initial_location = {:#x}, address_range = {:#x}",
         fde.initial_location, fde.address_range
     );
@@ -488,7 +525,7 @@ fn execute_fde(fsw: &mut Fsw, fde: &Fde, cie: &Cie) -> Result<()> {
     }
     submit_row(fsw, &cft);
     submit_end(fsw, fde.initial_location + fde.address_range);
-    println!("End at {:x} of range {:x} - {:x}", cft.loc,
+    info!("End at {:x} of range {:x} - {:x}", cft.loc,
         fde.initial_location, fde.initial_location + fde.address_range - 1);
 
     Ok(())
@@ -514,22 +551,72 @@ fn parse_fde(data: &[u8], pc: u64, dwarf64: bool, cie: &Cie) -> Result<Fde> {
     })
 }
 
-fn main() -> Result<()> {
-    let path = std::path::PathBuf::from("./ceph-osd");
-    let file = File::open(path).expect("Could not open file.");
+struct ProcessMaps {
+    vm_start: u64,
+    vm_end: u64,
+    offset: u64,
+    pathname: String,
+}
+
+fn read_process_maps(pid: i32) -> Result<Vec<ProcessMaps>> {
+    let mut maps = Vec::new();
+    let file = File::open(format!("/proc/{}/maps", pid))?;
+    for line in std::io::BufReader::new(&file).lines() {
+        let line = line?;
+        //println!("maps line: {}", line?);
+        let toks = line.split_whitespace().collect::<Vec<&str>>();
+        let mut parts = toks[0].split('-');
+        let vm_start = u64::from_str_radix(parts.next().unwrap(), 16)?;
+        let vm_end = u64::from_str_radix(parts.next().unwrap(), 16)?;
+        let perms = toks[1];
+        let offset = u64::from_str_radix(toks[2], 16)?;
+        let _dev = toks[3];
+        let inode = toks[4].parse::<u64>()?;
+        let pathname = if toks.len() >= 5 {
+            toks[5..].join(" ")
+        } else {
+            String::new()
+        };
+
+        info!("map: vm_start {:#x} vm_end {:#x} offset {:#x} pathname {}",
+            vm_start, vm_end, offset, pathname);
+        if inode == 0 {
+            continue; // skip anonymous mappings
+        }
+        if perms.chars().any(|c| c == 'x') {
+            continue; // skip non-executable mappings
+        }
+
+        if pathname.is_empty() {
+            bail!("pathname for vm_start {:x} is empty", vm_start);
+        }
+        maps.push(ProcessMaps {
+            vm_start,
+            vm_end,
+            offset,
+            pathname,
+        });
+    }
+
+    Ok(maps)
+}
+
+fn build_fsw(pathname: &str) -> Result<Fsw> {
+    let path = std::path::PathBuf::from(pathname);
+    let file = File::open(path).context("Could not open file.")?;
     let mut elf = ElfStream::<AnyEndian, _>::open_stream(&file)
-        .expect("Could not parse ELF file.");
+        .context("Could not parse ELF file.")?;
     let eh_hdr = *elf
         .section_header_by_name(".eh_frame")
-        .expect("section table should be parseable")
-        .expect("no .eh_frame section in file");
+        .context("section table should be parseable")?
+        .context("no .eh_frame section in file")?;
 
     debug!(".eh_frame section header: {:#?}", &eh_hdr);
 
     // XXX TODO: read as stream
     let (eh, comp) = elf
         .section_data(&eh_hdr)
-        .expect("could not get .eh_frame section data");
+        .context("could not get .eh_frame section data")?;
 
     if comp.is_some() {
         bail!(".eh_frame is compressed, cannot decompress");
@@ -558,39 +645,42 @@ fn main() -> Result<()> {
     };
     while offset < eh.len() {
         let frame_len = read_uint(&eh, dwarf64, &mut offset)
-            .expect("could not read frame length");
+            .context("could not read frame length")?;
         debug!("frame: {:x?}", &eh[offset..offset + frame_len as usize]);
         if frame_len == 0 {
-            println!("reached end of .eh_frame");
+            debug!("reached end of .eh_frame");
             break;
         }
         // CIE or FDE?
         let frame_end = offset + frame_len as usize;
         let id_offset = offset;
         let id = read_uint(&eh, dwarf64, &mut offset)
-            .expect("could not read frame id");
+            .context("could not read frame id")?;
         debug!("frame length: {} id {}", frame_len, id);
         // on debug_frame, this is different
         let pc = offset as u64 + eh_hdr.sh_addr;
         if id == 0 {
             // CIE
             let cie = parse_eh_cie(&eh[offset..frame_end], pc, dwarf64)
-                .expect("could not parse CIE");
+                .context("could not parse CIE")?;
             debug!("parsed eh CIE: {:?}, id_offset {}", cie, id_offset);
             cies.insert(id_offset as u64, cie);
         } else if id == 0xffffffff {
             // debug_frame CIE
             parse_debug_cie(&eh, dwarf64, &mut offset)
-                .expect("could not parse debug_frame CIE");
+                .context("could not parse debug_frame CIE")?;
         } else {
             // FDE
             debug!("parsing eh FDE with CIE id {}, offset {}", id, offset);
             let cie_addr = offset as u64 - id;
-            let cie = cies.get(&cie_addr).expect("could not find CIE for FDE");
+            let cie = cies.get(&cie_addr).context("could not find CIE for FDE")?;
             let fde = parse_fde(&eh[offset..frame_end], pc, dwarf64, &cie)
-                .expect("could not parse FDE");
+                .context("could not parse FDE")?;
             debug!("parsed eh FDE: {:?}", fde);
-            execute_fde(&mut fsw, &fde, &cie)?;
+            let res = execute_fde(&mut fsw, &fde, &cie);
+            if let Err(e) = res {
+                warn!("error executing FDE at offset {}: {:?}", offset, e);
+            }
         }
         if offset > frame_end {
             bail!("consume more than the frame");
@@ -598,6 +688,45 @@ fn main() -> Result<()> {
         offset = frame_end;
     }
 
+    // print CFT statistics
+    println!("CFT Statistics:");
+    println!("  Total unique CFTs: {}", fsw.cft_forw.len());
+    println!("  Total CFT entries: {}", fsw.entries.len());
+
+    Ok(fsw)
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+
+    let pid = 3961;
+
+    // read process maps from /proc/[pid]/maps
+    let maps = read_process_maps(pid)?;
+
+
+    // find all binaries and build unwind tables
+    let mut objlist = BTreeMap::new();
+    let mut next_id = 1u32;
+    for map in maps.iter() {
+        if objlist.contains_key(&map.pathname) {
+            continue; // already processed
+        }
+        objlist.insert(map.pathname.clone(), next_id);
+        next_id += 1;
+        println!("Object ID {}: {}", next_id, map.pathname);
+        let fsw = build_fsw(&map.pathname);
+        match fsw {
+            Ok(_) => {
+                println!("Successfully built FSW for {}", map.pathname);
+            }
+            Err(e) => {
+                println!("Error building FSW for {}: {:?}", map.pathname, e);
+            }
+        }
+    }
+
+/*
     // Do a test stack walk
     let mut stack_file = File::open("./stack.dump")?;
     let mut stack_data = Vec::new();
@@ -698,6 +827,7 @@ fn main() -> Result<()> {
     println!("CFT Statistics:");
     println!("  Total unique CFTs: {}", fsw.cft_forw.len());
     println!("  Total CFT entries: {}", fsw.entries.len());
+*/
 
     Ok(())
 }
