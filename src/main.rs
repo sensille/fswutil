@@ -6,7 +6,7 @@ use elf::endian::AnyEndian;
 use std::collections::BTreeMap;
 use log::debug;
 
-#[derive(Clone)]
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[allow(dead_code)]
 enum RegisterRule {
     Uninitialized,
@@ -33,7 +33,7 @@ impl std::fmt::Debug for RegisterRule {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[allow(dead_code)]
 enum CFARule {
     Uninitialized,
@@ -51,7 +51,7 @@ impl std::fmt::Debug for CFARule {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 struct CFT {
     loc: u64,
     cfa: CFARule,
@@ -90,7 +90,10 @@ struct Fde {
 #[derive(Debug)]
 struct Fsw {
     dwarf64: bool,
-    entries: BTreeMap<u64, Option<CFT>>,
+    entries: BTreeMap<u64, Option<u64>>,
+    cft_forw: BTreeMap<u64, CFT>,
+    cft_rev: BTreeMap<CFT, u64>,
+    next_id: u64,
 }
 
 fn read_uint(data: &[u8], dwarf64: bool, offset: &mut usize) -> Result<u64> {
@@ -282,7 +285,19 @@ fn parse_eh_cie(data: &[u8], pc: u64, dwarf64: bool) -> Result<Cie> {
 fn submit_row(fsw: &mut Fsw, cft: &CFT) {
     println!("CFT Row: loc = {:#x} cfa = {:?} rules = {:?}",
         cft.loc, cft.cfa, cft.rules);
-    let old = fsw.entries.insert(cft.loc, Some(cft.clone()));
+    let mut canon_cft = cft.clone();
+    canon_cft.loc = 0; // ignore loc for canonicalization
+    let cft_id = fsw.cft_rev.get(&canon_cft);
+    let id = if let Some(id) = cft_id {
+        *id
+    } else {
+        let id = fsw.next_id;
+        fsw.cft_forw.insert(id, canon_cft.clone());
+        fsw.cft_rev.insert(canon_cft, id);
+        fsw.next_id += 1;
+        id
+    };
+    let old = fsw.entries.insert(cft.loc, Some(id));
     if let Some(Some(_)) = old {
         panic!("Warning: overwriting existing CFT entry at loc {:#x}", cft.loc);
     }
@@ -537,6 +552,9 @@ fn main() -> Result<()> {
     let mut fsw = Fsw {
         dwarf64,
         entries: BTreeMap::new(),
+        cft_forw: BTreeMap::new(),
+        cft_rev: BTreeMap::new(),
+        next_id: 1,
     };
     while offset < eh.len() {
         let frame_len = read_uint(&eh, dwarf64, &mut offset)
@@ -614,10 +632,12 @@ fn main() -> Result<()> {
             break;
         };
         let e = fsw.entries.range(..=(rip - map_offset)).rev().next();
-        let Some((_, Some(cft))) = e else {
+        let Some((_, Some(cft_id))) = e else {
             println!("Stack walk: PC {:#x}, no entry found, stopping", rip - map_offset);
             break;
         };
+        let cft = fsw.cft_forw.get(cft_id).unwrap();
+
         println!("Stack walk: PC {:#x}, found entry: {:?}", rip - map_offset, e);
 
         // compute CFA
@@ -673,6 +693,11 @@ fn main() -> Result<()> {
         println!("  next PC from r16: {:x?}", regs[16]);
         println!("  regs: {:x?}", regs);
     }
+
+    // print CFT statistics
+    println!("CFT Statistics:");
+    println!("  Total unique CFTs: {}", fsw.cft_forw.len());
+    println!("  Total CFT entries: {}", fsw.entries.len());
 
     Ok(())
 }
