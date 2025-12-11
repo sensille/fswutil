@@ -11,6 +11,7 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 const volatile uint32_t targ_pid = 0;
 
 #define LOG(...) bpf_printk(__VA_ARGS__)
+#define DBG(...) bpf_printk(__VA_ARGS__)
 
 /*
  * maps
@@ -75,7 +76,7 @@ find_mapping(struct mapping *m, uint64_t ip)
 			break;
 		struct map_entry *me = &m->entries[mid];
 
-		bpf_printk("bisection step %d: left %d right %d mid %d vma_start %lx",
+		DBG("bisection step %d: left %d right %d mid %d vma_start %lx",
 			i, left, right, mid, me->vma_start);
 		if (me->vma_start <= ip)
 			left = mid + 1;
@@ -83,15 +84,15 @@ find_mapping(struct mapping *m, uint64_t ip)
 			right = mid;
 	}
 	if (left == 0) {
-		LOG("ip %lx below first vma_start\n", ip);
+		LOG("ip %lx below first vma_start", ip);
 		return NULL;
 	}
 	--left;
 	if (left >= MAX_MAPPINGS)
 		return NULL;
 	struct map_entry *me = &m->entries[left];
-	bpf_printk("ip %lx found in mapping %d: %lx obj %d off %lx map %d",
-		ip, left, me->vma_start, me->obj_id_offset >> 48,
+	bpf_printk("ip %lx found in mapping %d: %lx obj %d (0x%x) off %lx map %d",
+		ip, left, me->vma_start, me->obj_id_offset >> 48, me->obj_id_offset >> 48,
 		me->obj_id_offset & 0xffffffffffff, me->offsetmap_id);
 	// safety check
 	if (left + 1 < n) {
@@ -125,15 +126,20 @@ find_cft(struct offsetmap *om, uint16_t obj_id, uint64_t offset)
 			break;
 		struct offsetmap_entry *ome = &om->entries[mid];
 
+		DBG("offset bisection step %d: left %d right %d mid %d obj_off %lx",
+			i, left, right, mid, ome->obj_id_offset);
+
 		if (ome->obj_id_offset <= key)
-			right = mid - 1;
+			left = mid + 1;
 		else
-			left = mid;
+			right = mid;
 
 	}
 	--left;
-	if (left >= MAX_OFFSETS)
+	if (left >= MAX_OFFSETS) {
+		LOG("left %d out of bounds", left);
 		return NULL;
+	}
 
 	struct offsetmap_entry *ome = &om->entries[left];
 	bpf_printk("key %lx found in offsets %d: %lx ctf %d",
@@ -151,6 +157,120 @@ find_cft(struct offsetmap *om, uint16_t obj_id, uint64_t offset)
 	return ome;
 }
 
+static int
+unwind_step(struct mapping *m, u64 *regs, u64 *regs_valid) {
+	if ((*regs_valid & (1 << RIP)) == 0) {
+		LOG("Stack walk: PC is None, stopping");
+		return -1;
+	}
+
+	struct map_entry *me = find_mapping(m, regs[RIP]);
+	if (me == NULL) {
+		LOG("no map entry found");
+		return -1;
+	}
+
+	struct offsetmap *om = bpf_map_lookup_elem(&offsetmaps, &me->offsetmap_id);
+	if (om == NULL) {
+		LOG("offsetmap not found");
+		return -1;
+	}
+	uint64_t offset = regs[RIP] - me->vma_start + (me->obj_id_offset & 0xffffffffffff);
+	bpf_printk("rip %lx vma_start %lx offset %lx", regs[RIP], me->vma_start, offset);
+	struct offsetmap_entry *ome = find_cft(om, me->obj_id_offset >> 48, offset);
+	if (ome == NULL) {
+		LOG("no offsetmap entry found");
+		return -1;
+	}
+
+	struct cft *cf = bpf_map_lookup_elem(&cfts, &ome->cft_id);
+	if (cf == NULL) {
+		LOG("cft not found");
+		return -1;
+	}
+	bpf_printk("cft %d found", ome->cft_id);
+
+	// XXX only copy when needed, invent a flag in cft
+	u64 old_regs[NUM_REGISTERS];
+	for (int i = 0; i < NUM_REGISTERS; ++i)
+		old_regs[i] = regs[i];
+
+	/* compute CFA */
+	uint64_t cfa;
+	if (cf->cfa.rtype == CFA_RULE_UNINITIALIZED) {
+		LOG("Stack walk: CFA uninitialized, stopping");
+		return -1;
+	} else if (cf->cfa.rtype == CFA_RULE_EXPRESSION) {
+		LOG("Stack walk: CFA expression not yet supported, stopping");
+		return -1;
+	} else if (cf->cfa.rtype == CFA_RULE_REG_OFFSET) {
+		u32 r = cf->cfa.data.reg_offset.reg;
+		s64 o = cf->cfa.data.reg_offset.offset;
+		if ((*regs_valid & (1 << r)) == 0) {
+			LOG("Stack walk: CFA register r%d not valid, stopping", r);
+			return -1;
+		}
+		if (r >= NUM_REGISTERS) {
+			LOG("Stack walk: CFA register r%d out of range, stopping", r);
+			return -1;
+		}
+		cfa = regs[r] + o;
+		bpf_printk("  CFA = r%d (%lx) + %lld = %lx", r, regs[r], o, cfa);
+	} else {
+		LOG("Stack walk: unknown CFA rule type %d, stopping", cf->cfa.rtype);
+		return -1;
+	}
+
+        // unwind stack pointer
+        regs[RSP] = cfa;
+
+#if 1
+	for (int reg = 0; reg < NUM_REGISTERS; ++reg) {
+		*regs_valid = scramble(scramble(*regs_valid));
+		if (cf->rules[reg].rtype == REGISTER_RULE_UNINITIALIZED ||
+		    cf->rules[reg].rtype == REGISTER_RULE_SAME_VALUE) {
+			// register is unchanged
+			bpf_printk("  r%d: same value %lx", reg, regs[reg]);
+		} else if (cf->rules[reg].rtype == REGISTER_RULE_UNDEFINED) {
+			// register is undefined
+			bpf_printk("  r%d: undefined", reg);
+			*regs_valid &= ~(1 << reg);
+		} else if (cf->rules[reg].rtype == REGISTER_RULE_OFFSET) {
+			// register is at CFA + offset
+			s64 off = cf->rules[reg].data.offset;
+			u64 addr = cfa + off;
+			// read value from user stack
+			u64 val = 0;
+			int ret = bpf_probe_read_user(&val, sizeof(val), (void *)addr);
+			if (ret < 0) {
+				LOG("Stack walk: failed to read r%d at addr %lx, stopping",
+					reg, addr);
+				return -1;
+			}
+			bpf_printk("  r%d: at addr %lx value %lx", reg, addr, val);
+			regs[reg] = val;
+			*regs_valid |= (1 << reg);
+                // XXX use old_regs for register to register copy
+		} else {
+			LOG("Stack walk: unsupported register rule type %d for r%d, stopping",
+				cf->rules[reg].rtype, reg);
+			return -1;
+		}
+	}
+#endif
+
+	bpf_printk("After unwind step: next PC %lx", regs[RIP]);
+	for (int reg = 0; reg < NUM_REGISTERS; ++reg) {
+		if (*regs_valid & (1 << reg)) {
+			bpf_printk("  r%d: %lx", reg, regs[reg]);
+		} else {
+			bpf_printk("  r%d: <invalid>", reg);
+		}
+	}
+
+	return 0;
+}
+
 SEC("perf_event")
 int BPF_KPROBE(uprobe_add)
 {
@@ -166,7 +286,7 @@ int BPF_KPROBE(uprobe_add)
 
 	task = bpf_get_current_task_btf();
 	if (task == NULL) {
-		LOG("no task struct\n");
+		LOG("no task struct");
 		return 0;
 	}
 
@@ -179,7 +299,7 @@ int BPF_KPROBE(uprobe_add)
 	struct thread_info *ti = NULL;
 	bpf_probe_read_kernel(&ti, 8, &task->thread_info);
 	if (ti == NULL) {
-		LOG("no thread info\n");
+		LOG("no thread info");
 		return 0;
 	}
 	unsigned long ti_flags = BPF_CORE_READ(ti, flags);
@@ -189,7 +309,7 @@ int BPF_KPROBE(uprobe_add)
 	bpf_printk("kernel stack: %lx", BPF_CORE_READ(task, stack));
 	struct mm_struct *mm = BPF_CORE_READ(task, mm);
 	if (mm == NULL) {
-		LOG("no mm struct\n");
+		LOG("no mm struct");
 		return 0;
 	}
 	bpf_printk("mm: %lx", mm);
@@ -201,7 +321,7 @@ int BPF_KPROBE(uprobe_add)
 	 */
 	struct pt_regs *pregs = (struct pt_regs *)bpf_task_pt_regs(task);
 	if (pregs == NULL) {
-		LOG("no pt_regs\n");
+		LOG("no pt_regs");
 		return 0;
 	}
 	bpf_printk("pt_regs is %lx", pregs);
@@ -231,36 +351,29 @@ int BPF_KPROBE(uprobe_add)
 
 	bpf_printk("pid %d tgid %d", pid, tgid);
 
-#if 0
-	// unfortunately this does not seem to be present in ubuntu2204lts
-	long ret = bpf_find_vma(task, regs[16], vma_cb, NULL, 0);
-	bpf_printk("find_vma returned %d\n", ret);
-#else
 	/*
 	 * load mapping for pid
+	 * eventually we might want to use bpf_find_vma if it is widely available
 	 */
 	struct mapping *m = bpf_map_lookup_elem(&mappings, &tgid);
 	if (m == NULL) {
-		LOG("no mapping found\n");
+		LOG("no mapping found");
 		return 0;
 	}
 	bpf_printk("nmappings %d", m->nentries);
-	struct map_entry *me = find_mapping(m, regs[16]);
-	if (me == NULL) {
-		LOG("no map entry found\n");
-		return 0;
+
+	uint64_t regs_valid = 0x1ffff;
+	int i;
+	for (i = 0; i < 8 /*MAX_STACK_FRAMES */; ++i) {
+		regs_valid = scramble(scramble(regs_valid));
+		int ret = unwind_step(m, regs, &regs_valid);
+		if (ret < 0) {
+			LOG("unwind step %d failed", i);
+			break;
+		}
 	}
 
-	struct offsetmap *om = bpf_map_lookup_elem(&offsetmaps, &me->offsetmap_id);
-	if (om == NULL) {
-		LOG("offsetmap not found\n");
-		return 0;
-	}
-	uint64_t offset = regs[16] - me->vma_start;
-	bpf_printk("r16 %lx vma_start %lx offset %lx", regs[16], me->vma_start, offset);
-	find_cft(om, me->obj_id_offset >> 48, offset);
-#endif
-
+	bpf_printk("walked %d steps", i);
 	bpf_printk("\n");
 	return 0;
 }

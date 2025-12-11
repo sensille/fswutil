@@ -106,10 +106,10 @@ struct Fde {
 struct ProcessState {
     maps_by_id: HashMap<u64, Vec<ProcessMaps>>, // (obj_id, offset) -> mapping
     maps: BTreeSet<ProcessMaps>,
-    entries: BTreeMap<(u64, u64), Option<u64>>,
-    cft_forw: BTreeMap<u64, CFT>,
-    cft_rev: BTreeMap<CFT, u64>,
-    next_id: u64,
+    entries: BTreeMap<(u64, u64), Option<u32>>,
+    cft_forw: BTreeMap<u32, CFT>,
+    cft_rev: BTreeMap<CFT, u32>,
+    next_id: u32,
 }
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
@@ -1023,7 +1023,7 @@ fn main() -> Result<()> {
     // build CFT table
     let mut expr_id = 0u32;
     for (cft_id, cft) in state.cft_forw.iter() {
-        let mut m_cft = types::cft_entry {
+        let mut m_cft = types::cft {
             arg_size: cft.arg_size,
             ..Default::default()
         };
@@ -1041,7 +1041,7 @@ fn main() -> Result<()> {
             }
             CFARule::RegOffset(r, o) => {
                 m_cft.cfa.rtype = types::cfa_rule_type::CFA_RULE_REG_OFFSET;
-                m_cft.cfa.data.reg_offset.reg = *r as u8;
+                m_cft.cfa.data.reg_offset.reg = *r as u32;
                 m_cft.cfa.data.reg_offset.offset = *o;
             }
         }
@@ -1085,8 +1085,8 @@ fn main() -> Result<()> {
         }
         let r_b = unsafe {
             std::slice::from_raw_parts(
-                (&m_cft as *const types::cft_entry) as *const u8,
-                std::mem::size_of::<types::cft_entry>(),
+                (&m_cft as *const types::cft) as *const u8,
+                std::mem::size_of::<types::cft>(),
             )
         };
 
@@ -1124,104 +1124,8 @@ fn main() -> Result<()> {
     skel.attach()
         .context("failed to attach FSW skel")?;
 
+    println!("FSW attached, sleeping...");
     std::thread::sleep(std::time::Duration::from_secs(100));
-/*
-    // Do a test stack walk
-    let mut stack_file = File::open("./stack.dump")?;
-    let mut stack_data = Vec::new();
-    stack_file.read_to_end(&mut stack_data)?;
-    let regs = vec![
-        0x0u64,   // rax
-        0x55c897e7fd50,  // rdx
-        0x55c803185790, // rcx
-        0x55c897e7fd78, // rbx
-        0x55c86af87200, // rsi
-        0x55c8592fe000, // rdi
-        0x7fb998af8030, // rbp
-        0x7fb998af7a48, // rsp
-        0x55c897e7fd78, // r8
-        0x20,           // r9
-        0x1000,         // r10
-        0x55c86af87200, // r11
-        0x0,            // r12
-        0x55c858d260a0, // r13
-        0xfffffffffffffffe, // r14
-        0x55c86af87200, // r15
-        0x55c802509ac0, // rip
-    ];
-    let mut regs = regs.into_iter().map(|v| Some(v)).collect::<Vec<Option<u64>>>();
-
-    let map_offset = 0x55c80220d000 - 0x377000;
-    let stack_start = regs[7].unwrap(); // rsp
-
-    loop {
-        let Some(rip) = regs[16] else {
-            println!("Stack walk: PC is None, stopping");
-            break;
-        };
-        let e = fsw.entries.range(..=(rip - map_offset)).rev().next();
-        let Some((_, Some(cft_id))) = e else {
-            println!("Stack walk: PC {:#x}, no entry found, stopping", rip - map_offset);
-            break;
-        };
-        let cft = fsw.cft_forw.get(cft_id).unwrap();
-
-        println!("Stack walk: PC {:#x}, found entry: {:?}", rip - map_offset, e);
-
-        // compute CFA
-        let cfa = match cft.cfa {
-            CFARule::Uninitialized => {
-                println!("Stack walk: CFA uninitialized, stopping");
-                break;
-            }
-            CFARule::Expression(_) => {
-                println!("Stack walk: CFA expression not supported, stopping");
-                break;
-            }
-            CFARule::RegOffset(r, o) => {
-                let reg_val = match regs[r] {
-                    Some(v) => v,
-                    None => {
-                        println!("Stack walk: CFA register r{} is None, stopping", r);
-                        break;
-                    }
-                };
-                let cfa = (reg_val as i64 + o) as u64;
-                println!("  CFA = r{} ({:#x}) + {} = {:#x}", r, reg_val, o, cfa);
-                cfa
-            }
-        };
-
-        let _old_regs = regs.clone();
-
-        // unwind stack pointer
-        regs[7] = Some(cfa);
-
-        for reg in 0..regs.len() {
-            match &cft.rules[reg] {
-                RegisterRule::Uninitialized|RegisterRule::SameValue => {
-                    // register is unchanged
-                }
-                RegisterRule::Undefined => {
-                    regs[reg] = None;
-                }
-                RegisterRule::Offset(off) => {
-                    let addr = (cfa as i64 + *off) as u64;
-                    let val = u64::from_le_bytes(stack_data[(addr - stack_start) as usize ..
-                        ((addr - stack_start) + 8) as usize].try_into().unwrap());
-                    println!("  r{}: at addr {:#x} value {:#x}", reg, addr, val);
-                    regs[reg] = Some(val);
-                }
-                // XXX use old_regs for register to register copy
-                _ => {
-                    panic!("unsupported register rule for stack walk: {:?}", cft.rules[reg]);
-                }
-            }
-        }
-        println!("  next PC from r16: {:x?}", regs[16]);
-        println!("  regs: {:x?}", regs);
-    }
-*/
 
     Ok(())
 }

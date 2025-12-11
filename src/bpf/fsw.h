@@ -12,6 +12,10 @@
 #define MAX_EXPRESSION_LEN 255
 #define NUM_REGISTERS 17		// 16 + RIP
 
+#define RSP 7
+#define RIP 16
+#define MAX_STACK_FRAMES 64
+
 #pragma pack(1)
 struct mapping {
 	uint64_t	nentries;
@@ -31,49 +35,47 @@ struct offsetmap {
 };
 
 enum register_rule_type {
-    REGISTER_RULE_UNINITIALIZED = 0,
-    REGISTER_RULE_UNDEFINED = 1,
-    REGISTER_RULE_SAME_VALUE = 2,
-    REGISTER_RULE_OFFSET = 3,
-    REGISTER_RULE_VAL_OFFSET = 4,
-    REGISTER_RULE_REGISTER = 5,
-    REGISTER_RULE_EXPRESSION = 6,
-    REGISTER_RULE_VAL_EXPRESSION = 7,
+	REGISTER_RULE_UNINITIALIZED = 0,
+	REGISTER_RULE_UNDEFINED = 1,
+	REGISTER_RULE_SAME_VALUE = 2,
+	REGISTER_RULE_OFFSET = 3,
+	REGISTER_RULE_VAL_OFFSET = 4,
+	REGISTER_RULE_REGISTER = 5,
+	REGISTER_RULE_EXPRESSION = 6,
+	REGISTER_RULE_VAL_EXPRESSION = 7,
 };
 
 struct register_rule {
-    enum register_rule_type	rtype;
-    union register_rule_data {
-	uint64_t	reg;
-	int64_t		offset;
-	uint32_t	expression_id;
-    } data;
+	enum register_rule_type	rtype;
+	union register_rule_data {
+		uint64_t	reg;
+		int64_t		offset;
+		uint32_t	expression_id;
+	} data;
 };
 
 enum cfa_rule_type {
-    CFA_RULE_UNINITIALIZED = 0,
-    CFA_RULE_REG_OFFSET = 1,
-    CFA_RULE_EXPRESSION = 2,
+	CFA_RULE_UNINITIALIZED = 0,
+	CFA_RULE_REG_OFFSET = 1,
+	CFA_RULE_EXPRESSION = 2,
 };
 
 struct cfa_rule {
-    enum cfa_rule_type	rtype;
-    union cfa_rule_data {
+	enum cfa_rule_type	rtype;
+	union cfa_rule_data {
 	struct reg_offset {
-		uint8_t		reg;
+		uint32_t	reg;
 		int64_t		offset;
 	} reg_offset;
-	uint32_t	expression_id;
-    } data;
+		uint32_t	expression_id;
+	} data;
 };
 
 struct cft {
-	uint64_t	nentries;
-	struct cft_entry {
-		struct cfa_rule cfa;
-		struct register_rule rules[NUM_REGISTERS];
-		uint64_t arg_size;
-	} entries[MAX_CFT_ENTRIES];
+	uint64_t arg_size; /* 8 bytes */
+	struct cfa_rule cfa; /* 16 bytes */
+	struct register_rule rules[NUM_REGISTERS];	/* 17 * 12 = 204 bytes */
+	/* total: 225 bytes */
 };
 
 struct expression {
