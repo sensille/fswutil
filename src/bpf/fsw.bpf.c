@@ -42,7 +42,7 @@ static uint32_t __attribute__((optnone)) scramble(uint32_t val) {
         return val ^ 0xFFFFFFFF;
 }
 
-static void
+static struct map_entry *
 find_mapping(struct mapping *m, uint64_t ip)
 {
 	int i;
@@ -51,31 +51,90 @@ find_mapping(struct mapping *m, uint64_t ip)
 		n = MAX_MAPPINGS;
 
 	uint32_t left = 0;
-	uint32_t right = n - 1;
+	uint32_t right = n;
 	uint32_t mid = 0;
-	for (i = 0; i < MAX_MAPPINGS_BISECT_STEPS && left <= right; ++i) {
-		mid = left + (right - left) / 2;
+	for (i = 0; i < MAX_MAPPINGS_BISECT_STEPS && left < right; ++i) {
+		mid = (left + right) / 2;
 		// XXX TODO expensive
 		mid = scramble(scramble(mid));
 		if (mid >= MAX_MAPPINGS)
 			break;
 		struct map_entry *me = &m->mappings[mid];
 
-		if (ip < me->vma_start)
-			right = mid - 1;
-		else if (ip >= me->vma_start)
+		bpf_printk("bisection step %d: left %d right %d mid %d vma_start %lx",
+			i, left, right, mid, me->vma_start);
+		if (me->vma_start <= ip)
 			left = mid + 1;
+		else
+			right = mid;
 	}
-	if (mid >= MAX_MAPPINGS)
-		return;
-	struct map_entry *me = &m->mappings[mid];
+	if (left == 0) {
+		LOG("ip %lx below first vma_start\n", ip);
+		return NULL;
+	}
+	--left;
+	if (left >= MAX_MAPPINGS)
+		return NULL;
+	struct map_entry *me = &m->mappings[left];
 	bpf_printk("ip %lx found in mapping %d: %lx obj %d off %lx map %d",
-		ip, mid, me->vma_start, me->obj_id_offset >> 48,
+		ip, left, me->vma_start, me->obj_id_offset >> 48,
 		me->obj_id_offset & 0xffffffffffff, me->offsetmap_id);
-	if (mid + 1 < n) {
-		me = &m->mappings[mid + 1];
-		bpf_printk("next map starts at %lx", me->vma_start);
+	// safety check
+	if (left + 1 < n) {
+		struct map_entry *nme = &m->mappings[left + 1];
+		if (ip >= nme->vma_start) {
+			bpf_printk("BAD: ip %lx >= next vma_start %lx, no match",
+				ip, nme->vma_start);
+			return NULL;
+		}
 	}
+	return me;
+}
+
+static struct offsetmap_entry *
+find_cft(struct offsetmap *om, uint16_t obj_id, uint64_t offset)
+{
+	uint64_t key = (uint64_t)obj_id << 48 | offset;
+	int i;
+	uint32_t n = om->nentries;
+	if (n > MAX_OFFSETS)
+		n = MAX_OFFSETS;
+
+	uint32_t left = 0;
+	uint32_t right = n;
+	uint32_t mid = 0;
+	for (i = 0; i < MAX_OFFSETS_BISECT_STEPS && left <= right; ++i) {
+		mid = left + (right - left) / 2;
+		// XXX TODO expensive
+		mid = scramble(scramble(mid));
+		if (mid >= MAX_OFFSETS)
+			break;
+		struct offsetmap_entry *ome = &om->entries[mid];
+
+		if (ome->obj_id_offset <= key)
+			right = mid - 1;
+		else
+			left = mid;
+
+	}
+	--left;
+	if (left >= MAX_OFFSETS)
+		return NULL;
+
+	struct offsetmap_entry *ome = &om->entries[left];
+	bpf_printk("key %lx found in offsets %d: %lx ctf %d",
+		key, left, ome->obj_id_offset, ome->cft_id);
+	// safety check
+	if (left + 1 < n) {
+		struct offsetmap_entry *nome = &om->entries[left + 1];
+		if (key >= nome->obj_id_offset) {
+			bpf_printk("BAD: key %lx >= next key %lx, no match",
+				key, nome->obj_id_offset);
+			return NULL;
+		}
+	}
+
+	return ome;
 }
 
 SEC("perf_event")
@@ -172,8 +231,20 @@ int BPF_KPROBE(uprobe_add)
 		return 0;
 	}
 	bpf_printk("nmappings %d", m->nmappings);
-	find_mapping(m, regs[16]);
+	struct map_entry *me = find_mapping(m, regs[16]);
+	if (me == NULL) {
+		LOG("no map entry found\n");
+		return 0;
+	}
 
+	struct offsetmap *om = bpf_map_lookup_elem(&offsetmaps, &me->offsetmap_id);
+	if (om == NULL) {
+		LOG("offsetmap not found\n");
+		return 0;
+	}
+	uint64_t offset = regs[16] - me->vma_start;
+	bpf_printk("r16 %lx vma_start %lx offset %lx", regs[16], me->vma_start, offset);
+	find_cft(om, me->obj_id_offset >> 48, offset);
 #endif
 
 	bpf_printk("\n");
