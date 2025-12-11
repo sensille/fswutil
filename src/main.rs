@@ -104,12 +104,23 @@ struct Fde {
 }
 
 #[derive(Debug)]
-struct Fsw {
-    dwarf64: bool,
-    entries: BTreeMap<u64, Option<u64>>,
+struct ProcessState {
+    maps_by_id: HashMap<u64, Vec<ProcessMaps>>, // (obj_id, offset) -> mapping
+    maps: BTreeSet<ProcessMaps>,
+    entries: BTreeMap<(u64, u64), Option<u64>>,
     cft_forw: BTreeMap<u64, CFT>,
     cft_rev: BTreeMap<CFT, u64>,
     next_id: u64,
+}
+
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+struct ProcessMaps {
+    vm_start: u64,
+    vm_end: u64,
+    offset: u64,
+    pathname: String,
+    perms: String,
+    obj_id: u64,
 }
 
 fn read_uint(data: &[u8], dwarf64: bool, offset: &mut usize) -> Result<u64> {
@@ -301,39 +312,42 @@ fn parse_eh_cie(data: &[u8], pc: u64, dwarf64: bool) -> Result<Cie> {
     })
 }
 
-fn submit_row(fsw: &mut Fsw, cft: &CFT) {
+fn submit_row(state: &mut ProcessState, obj_id: u64, cft: &CFT) {
     info!("CFT Row: loc = {:#x} cfa = {:?} rules = {:?}",
         cft.loc, cft.cfa, cft.rules);
     let mut canon_cft = cft.clone();
     canon_cft.loc = 0; // ignore loc for canonicalization
-    let cft_id = fsw.cft_rev.get(&canon_cft);
+    let cft_id = state.cft_rev.get(&canon_cft);
     let id = if let Some(id) = cft_id {
         *id
     } else {
-        let id = fsw.next_id;
-        fsw.cft_forw.insert(id, canon_cft.clone());
-        fsw.cft_rev.insert(canon_cft, id);
-        fsw.next_id += 1;
+        let id = state.next_id;
+        state.cft_forw.insert(id, canon_cft.clone());
+        state.cft_rev.insert(canon_cft, id);
+        state.next_id += 1;
         id
     };
-    let old = fsw.entries.insert(cft.loc, Some(id));
+    let old = state.entries.insert((obj_id, cft.loc), Some(id));
     if let Some(Some(_)) = old {
         panic!("Warning: overwriting existing CFT entry at loc {:#x}", cft.loc);
     }
 }
 
-fn submit_end(fsw: &mut Fsw, loc: u64) {
+fn submit_end(state: &mut ProcessState, obj_id: u64, loc: u64) {
     info!("CFT End Row: loc = {:#x}", loc);
-    let e = fsw.entries.get(&loc);
+    let key = (obj_id, loc);
+    let e = state.entries.get(&key);
     // don't overwrite existing (non-end) entries
     if let Some(Some(_)) = e {
         debug!("overwriting existing CFT entry at loc {:#x}", loc);
         return;
     }
-    fsw.entries.insert(loc, None);
+    state.entries.insert(key, None);
 }
 
-fn execute_instructions(fsw: &mut Fsw, instructions: &[u8], cie: &Cie, cft: &mut CFT) -> Result<()> {
+fn execute_instructions(state: &mut ProcessState, obj_id: u64, dwarf64: bool, instructions: &[u8],
+    cie: &Cie, cft: &mut CFT) -> Result<()>
+{
     debug!("Executing instructions: {:x?}", instructions);
     let mut offset = 0;
     let mut cft_stack: Vec<CFT> = Vec::new();
@@ -348,29 +362,29 @@ fn execute_instructions(fsw: &mut Fsw, instructions: &[u8], cie: &Cie, cft: &mut
             }
             0x01 => {
                 // DW_CFA_set_loc
-                submit_row(fsw, &cft);
+                submit_row(state, obj_id, &cft);
                 //cft.loc = read_uint(instructions, false, &mut offset)?;
                 cft.loc = read_encoded_ptr(instructions, cie.fde_encoding,
-                    0, fsw.dwarf64, &mut offset)?;
+                    0, dwarf64, &mut offset)?;
                 debug!("DW_CFA_set_loc to {:#x}", cft.loc);
             }
             0x02 => {
                 // DW_CFA_advance_loc1
-                submit_row(fsw, &cft);
+                submit_row(state, obj_id, &cft);
                 let delta = read_u8(instructions, &mut offset)? as u64;
                 debug!("DW_CFA_advance_loc1 by {}", delta);
                 cft.loc += delta * cie.caf;
             }
             0x03 => {
                 // DW_CFA_advance_loc2
-                submit_row(fsw, &cft);
+                submit_row(state, obj_id, &cft);
                 let delta = read_u16(instructions, &mut offset)? as u64;
                 debug!("DW_CFA_advance_loc2 by {}", delta);
                 cft.loc += delta * cie.caf;
             }
             0x04 => {
                 // DW_CFA_advance_loc4
-                submit_row(fsw, &cft);
+                submit_row(state, obj_id, &cft);
                 let delta = read_u32(instructions, &mut offset)? as u64;
                 debug!("DW_CFA_advance_loc4 by {}", delta);
                 cft.loc += delta * cie.caf;
@@ -486,7 +500,7 @@ fn execute_instructions(fsw: &mut Fsw, instructions: &[u8], cie: &Cie, cft: &mut
             }
             0x40..=0x7f => {
                 // DW_CFA_advance_loc
-                submit_row(fsw, &cft);
+                submit_row(state, obj_id, &cft);
                 let delta = (instr & 0x3f) as u64;
                 debug!("DW_CFA_advance_loc by {}", delta);
                 cft.loc += delta;
@@ -520,7 +534,9 @@ fn execute_instructions(fsw: &mut Fsw, instructions: &[u8], cie: &Cie, cft: &mut
     Ok(())
 }
 
-fn execute_fde(fsw: &mut Fsw, fde: &Fde, cie: &Cie) -> Result<()> {
+fn execute_fde(state: &mut ProcessState, obj_id: u64, dwarf64: bool,
+    fde: &Fde, cie: &Cie) -> Result<()>
+{
     info!(
         "Executing FDE: initial_location = {:#x}, address_range = {:#x}",
         fde.initial_location, fde.address_range
@@ -533,13 +549,13 @@ fn execute_fde(fsw: &mut Fsw, fde: &Fde, cie: &Cie) -> Result<()> {
         arg_size: 0,
     };
     debug!("FDE Instructions: {:x?}", fde.instructions);
-    execute_instructions(fsw, &cie.initial_cfa, &cie, &mut cft)?;
-    execute_instructions(fsw, &fde.instructions, &cie, &mut cft)?;
+    execute_instructions(state, obj_id, dwarf64, &cie.initial_cfa, &cie, &mut cft)?;
+    execute_instructions(state, obj_id, dwarf64, &fde.instructions, &cie, &mut cft)?;
     if cft.loc >= fde.initial_location + fde.address_range {
         bail!("FDE instructions advanced location beyond address range");
     }
-    submit_row(fsw, &cft);
-    submit_end(fsw, fde.initial_location + fde.address_range);
+    submit_row(state, obj_id, &cft);
+    submit_end(state, obj_id, fde.initial_location + fde.address_range);
     info!("End at {:x} of range {:x} - {:x}", cft.loc,
         fde.initial_location, fde.initial_location + fde.address_range - 1);
 
@@ -564,16 +580,6 @@ fn parse_fde(data: &[u8], pc: u64, dwarf64: bool, cie: &Cie) -> Result<Fde> {
         address_range,
         instructions: data[offset..].into(),
     })
-}
-
-#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
-struct ProcessMaps {
-    vm_start: u64,
-    vm_end: u64,
-    offset: u64,
-    pathname: String,
-    perms: String,
-    obj_id: u64,
 }
 
 fn read_process_maps(pid: u32) -> Result<Vec<ProcessMaps>> {
@@ -617,12 +623,6 @@ fn read_process_maps(pid: u32) -> Result<Vec<ProcessMaps>> {
     Ok(maps)
 }
 
-#[derive(Debug)]
-struct ProcessState {
-    maps_by_id: HashMap<u64, Vec<ProcessMaps>>, // (obj_id, offset) -> mapping
-    maps: BTreeSet<ProcessMaps>,
-}
-
 impl ProcessState {
     fn add_to_map_tree(&mut self, obj_id: u64, addr: u64, size: u64) -> Result<()> {
         let entry = self.maps_by_id.get(&obj_id).expect("obj_id should exist");
@@ -646,7 +646,7 @@ impl ProcessState {
 // XXX TODO
 // - distinguish between expected and unexpected errors
 // - collect all parsing errors
-fn build_fsw(state: &mut ProcessState, obj_id: u64, pathname: &str) -> Result<Fsw> {
+fn build_fsw(state: &mut ProcessState, obj_id: u64, pathname: &str) -> Result<()> {
     let path = std::path::PathBuf::from(&pathname);
     let file = File::open(path).context("Could not open file.")?;
     let mut elf = ElfStream::<AnyEndian, _>::open_stream(&file)
@@ -681,13 +681,6 @@ fn build_fsw(state: &mut ProcessState, obj_id: u64, pathname: &str) -> Result<Fs
         offset = 4;
     }
     let mut cies = BTreeMap::new();
-    let mut fsw = Fsw {
-        dwarf64,
-        entries: BTreeMap::new(),
-        cft_forw: BTreeMap::new(),
-        cft_rev: BTreeMap::new(),
-        next_id: 1,
-    };
     while offset < eh.len() {
         let frame_len = read_uint(&eh, dwarf64, &mut offset)
             .context("could not read frame length")?;
@@ -724,12 +717,10 @@ fn build_fsw(state: &mut ProcessState, obj_id: u64, pathname: &str) -> Result<Fs
                 .context("could not parse FDE")?;
             debug!("parsed eh FDE: {:?}", fde);
             state.add_to_map_tree(obj_id, fde.initial_location, fde.address_range)?;
-            /*
-            let res = execute_fde(&mut fsw, &fde, &cie);
+            let res = execute_fde(state, obj_id, dwarf64, &fde, &cie);
             if let Err(e) = res {
                 warn!("error executing FDE at offset {}: {:?}", offset, e);
             }
-            */
         }
         if offset > frame_end {
             bail!("consume more than the frame");
@@ -737,12 +728,14 @@ fn build_fsw(state: &mut ProcessState, obj_id: u64, pathname: &str) -> Result<Fs
         offset = frame_end;
     }
 
+    /*
     // print CFT statistics
     println!("CFT Statistics:");
     println!("  Total unique CFTs: {}", fsw.cft_forw.len());
     println!("  Total CFT entries: {}", fsw.entries.len());
+    */
 
-    Ok(fsw)
+    Ok(())
 }
 
 fn init_perf_monitor(freq: u64, sw_event: bool) -> Result<Vec<i32>> {
@@ -796,9 +789,14 @@ fn main() -> Result<()> {
     env_logger::init();
 
     let pid: u32 = 3961;
+
     let mut state = ProcessState {
         maps_by_id: HashMap::new(),
         maps: BTreeSet::new(),
+        entries: BTreeMap::new(),
+        cft_forw: BTreeMap::new(),
+        cft_rev: BTreeMap::new(),
+        next_id: 0,
     };
 
     // read process maps from /proc/[pid]/maps
@@ -853,6 +851,11 @@ fn main() -> Result<()> {
             map.obj_id, map.vm_start, map.vm_end, map.offset, map.pathname);
     }
 
+    // print CFT statistics
+    println!("CFT Statistics:");
+    println!("  Total unique CFTs: {}", state.cft_forw.len());
+    println!("  Total CFT entries: {}", state.entries.len());
+
     let mut skel_builder = FswSkelBuilder::default();
     skel_builder.obj_builder.debug(true);
 
@@ -882,7 +885,6 @@ fn main() -> Result<()> {
         .context("failed to load FSW skel")?;
 
     let pid_b = pid.to_le_bytes();
-    let value = [0u8; 1];
     let mut m = types::mapping {
         nmappings: state.maps.len() as u64,
         ..Default::default() };
@@ -1031,11 +1033,6 @@ fn main() -> Result<()> {
         println!("  next PC from r16: {:x?}", regs[16]);
         println!("  regs: {:x?}", regs);
     }
-
-    // print CFT statistics
-    println!("CFT Statistics:");
-    println!("  Total unique CFTs: {}", fsw.cft_forw.len());
-    println!("  Total CFT entries: {}", fsw.entries.len());
 */
 
     Ok(())
