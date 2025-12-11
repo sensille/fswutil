@@ -8,6 +8,8 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
+const volatile uint32_t targ_pid = 0;
+
 #define LOG(...) bpf_printk(__VA_ARGS__)
 
 /*
@@ -28,10 +30,18 @@ vma_cb(struct task_struct *task, struct vm_area_struct *vma, void *ctx)
 	return 0;
 }
 
-SEC("uprobe")
+SEC("perf_event")
 int BPF_KPROBE(uprobe_add)
 {
 	struct task_struct *task;
+
+	uint64_t pid_tgid = bpf_get_current_pid_tgid();
+	uint32_t pid = pid_tgid & 0xffffffff;
+	uint32_t tgid = pid_tgid >> 32;
+
+	if (targ_pid != tgid) {
+		return 0;
+	}
 
 	task = bpf_get_current_task_btf();
 	if (task == NULL) {
@@ -39,7 +49,7 @@ int BPF_KPROBE(uprobe_add)
 		return 0;
 	}
 
-	bpf_printk("ctx is %p", ctx);
+	bpf_printk("ctx is %lx", ctx);
 #if 0
 	/*
 	 * is this a 64 or a 32 bit thread?
@@ -55,14 +65,14 @@ int BPF_KPROBE(uprobe_add)
 	bpf_printk("thread flags: %x", ti_flags);
 #endif
 
-	bpf_printk("kernel stack: %p", BPF_CORE_READ(task, stack));
+	bpf_printk("kernel stack: %lx", BPF_CORE_READ(task, stack));
 	struct mm_struct *mm = BPF_CORE_READ(task, mm);
 	if (mm == NULL) {
 		LOG("no mm struct\n");
 		return 0;
 	}
-	bpf_printk("mm: %p", mm);
-	bpf_printk("start stack: %p", BPF_CORE_READ(mm, start_stack));
+	bpf_printk("mm: %lx", mm);
+	bpf_printk("start stack: %lx", BPF_CORE_READ(mm, start_stack));
 	/*
 	 * user mode regs are passed in as ctx. We fetch
 	 * them anyway, so that it also works when called from
@@ -98,9 +108,6 @@ int BPF_KPROBE(uprobe_add)
 	regs[16] = BPF_CORE_READ(pregs, ip);
 	bpf_printk("rsp %lx ip %lx r8 %lx", regs[7], regs[16], regs[8]);
 
-	uint64_t pid_tgid = bpf_get_current_pid_tgid();
-	uint32_t pid = pid_tgid & 0xffffffff;
-	uint32_t tgid = pid_tgid >> 32;
 	bpf_printk("pid %d tgid %d", pid, tgid);
 
 #if 0

@@ -5,6 +5,21 @@ use elf::endian::AnyEndian;
 use std::collections::BTreeMap;
 use log::{debug, info, warn};
 use std::io::BufRead;
+use libbpf_rs::skel::OpenSkel;
+use libbpf_rs::skel::Skel;
+use libbpf_rs::skel::SkelBuilder;
+use libbpf_rs::MapCore;
+use libbpf_rs::MapFlags;
+use std::default::Default;
+
+mod fsw {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bpf/fsw.skel.rs"
+    ));
+}
+use fsw::*;
+mod syscall;
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 #[allow(dead_code)]
@@ -558,7 +573,7 @@ struct ProcessMaps {
     pathname: String,
 }
 
-fn read_process_maps(pid: i32) -> Result<Vec<ProcessMaps>> {
+fn read_process_maps(pid: u32) -> Result<Vec<ProcessMaps>> {
     let mut maps = Vec::new();
     let file = File::open(format!("/proc/{}/maps", pid))?;
     for line in std::io::BufReader::new(&file).lines() {
@@ -601,8 +616,11 @@ fn read_process_maps(pid: i32) -> Result<Vec<ProcessMaps>> {
     Ok(maps)
 }
 
-fn build_fsw(pathname: &str) -> Result<Fsw> {
-    let path = std::path::PathBuf::from(pathname);
+// XXX TODO
+// - distinguish between expected and unexpected errors
+// - collect all parsing errors
+fn build_fsw(map: &ProcessMaps) -> Result<Fsw> {
+    let path = std::path::PathBuf::from(&map.pathname);
     let file = File::open(path).context("Could not open file.")?;
     let mut elf = ElfStream::<AnyEndian, _>::open_stream(&file)
         .context("Could not parse ELF file.")?;
@@ -696,10 +714,57 @@ fn build_fsw(pathname: &str) -> Result<Fsw> {
     Ok(fsw)
 }
 
+fn init_perf_monitor(freq: u64, sw_event: bool) -> Result<Vec<i32>> {
+    let nprocs = libbpf_rs::num_possible_cpus().unwrap();
+    let pid = -1;
+    let attr = syscall::perf_event_attr {
+        _type: if sw_event {
+            syscall::PERF_TYPE_SOFTWARE
+        } else {
+            syscall::PERF_TYPE_HARDWARE
+        },
+        size: std::mem::size_of::<syscall::perf_event_attr>() as u32,
+        config: if sw_event {
+            syscall::PERF_COUNT_SW_CPU_CLOCK
+        } else {
+            syscall::PERF_COUNT_HW_CPU_CYCLES
+        },
+        sample: syscall::sample_un { sample_freq: freq },
+        flags: 1 << 10, // freq = 1
+        ..Default::default()
+    };
+    (0..nprocs)
+        .map(|cpu| {
+            let fd = syscall::perf_event_open(&attr, pid, cpu as i32, -1, 0) as i32;
+            if fd == -1 {
+                let mut error_context = "Failed to open perf event.";
+                let os_error = std::io::Error::last_os_error();
+                if !sw_event && os_error.kind() == std::io::ErrorKind::NotFound {
+                    error_context = "Failed to open perf event.\n\
+                                    Try running the profile example with the `--sw-event` option.";
+                }
+                Err(libbpf_rs::Error::from(os_error)).context(error_context)
+            } else {
+                Ok(fd)
+            }
+        })
+        .collect()
+}
+
+fn attach_perf_event(
+    pefds: &[i32],
+    prog: &libbpf_rs::ProgramMut,
+) -> Vec<Result<libbpf_rs::Link, libbpf_rs::Error>> {
+    pefds
+        .iter()
+        .map(|pefd| prog.attach_perf_event(*pefd))
+        .collect()
+}
+
 fn main() -> Result<()> {
     env_logger::init();
 
-    let pid = 3961;
+    let pid: u32 = 3961;
 
     // read process maps from /proc/[pid]/maps
     let maps = read_process_maps(pid)?;
@@ -715,7 +780,7 @@ fn main() -> Result<()> {
         objlist.insert(map.pathname.clone(), next_id);
         next_id += 1;
         println!("Object ID {}: {}", next_id, map.pathname);
-        let fsw = build_fsw(&map.pathname);
+        let fsw = build_fsw(&map);
         match fsw {
             Ok(_) => {
                 println!("Successfully built FSW for {}", map.pathname);
@@ -726,6 +791,82 @@ fn main() -> Result<()> {
         }
     }
 
+    let mut skel_builder = FswSkelBuilder::default();
+    skel_builder.obj_builder.debug(true);
+
+    let mut open_object = std::mem::MaybeUninit::uninit();
+    let mut open_skel = skel_builder.open(&mut open_object)
+        .context("failed to open FSW skel")?;
+
+    let rodata = open_skel
+        .maps
+        .rodata_data
+        .as_deref_mut()
+        .expect("`rodata` is not memory mapped");
+
+    // Write arguments into prog
+    rodata.targ_pid = pid;
+
+    /*
+    let uprobe_add = open_skel
+        .progs
+        .uprobe_add
+        .attach_uprobe(false, pid as i32, "/usr/bin/ceph-osd", 0)
+        .expect("`uprobe_add` program is not loaded");
+    */
+
+    // Begin tracing
+    let mut skel = open_skel.load()
+        .context("failed to load FSW skel")?;
+
+    let pid_b = pid.to_le_bytes();
+    let value = [0u8; 1];
+    let m = types::mapping {
+        nmappings: 1,
+        //mappings: [0u64; 500],
+        ..Default::default()
+    };
+    let m_b = unsafe {
+        std::slice::from_raw_parts(
+            (&m as *const types::mapping) as *const u8,
+            std::mem::size_of::<types::mapping>(),
+        )
+    };
+
+    let mappings = skel.maps.mappings.update(&pid_b, &m_b, MapFlags::ANY);
+
+    let pefds = init_perf_monitor(7, false)
+        .context("failed to initialize perf monitor")?;
+    let _links = attach_perf_event(&pefds, &skel.progs.uprobe_add);
+
+    /*
+            /* Attach tracepoint handler */
+        //fsw_opts.func_name = "_ZN12PrimaryLogPG7do_readEPNS_9OpContextER5OSDOp";
+        fsw_opts.func_name = "_ZN12PrimaryLogPG10do_osd_opsEPNS_9OpContextERSt6vectorI5OSDOpSaIS3_EE";
+        fsw_opts.retprobe = false;
+        /* fsw/uretprobe expects relative offset of the function to attach
+         * to. libbpf will automatically find the offset for us if we provide the
+         * function name. If the function name is not specified, libbpf will try
+         * to use the function offset instead.
+         */
+        char *probe;
+        asprintf(&probe, "/proc/%d/root/usr/bin/ceph-osd", pid);
+        skel->links.uprobe_add = bpf_program__attach_uprobe_opts(skel->progs.uprobe_add,
+                                                                 pid /* self pid */,
+                                                                 probe,
+                                                                 0 /* offset for function */,
+                                                                 &fsw_opts /* opts */);
+        if (!skel->links.uprobe_add) {
+                err = -errno;
+                fprintf(stderr, "Failed to attach fsw: %d\n", err);
+                goto cleanup;
+        }
+        */
+
+    skel.attach()
+        .context("failed to attach FSW skel")?;
+
+    std::thread::sleep(std::time::Duration::from_secs(100));
 /*
     // Do a test stack walk
     let mut stack_file = File::open("./stack.dump")?;
