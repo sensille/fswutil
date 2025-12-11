@@ -566,11 +566,14 @@ fn parse_fde(data: &[u8], pc: u64, dwarf64: bool, cie: &Cie) -> Result<Fde> {
     })
 }
 
+#[derive(Clone)]
 struct ProcessMaps {
     vm_start: u64,
     vm_end: u64,
     offset: u64,
     pathname: String,
+    perms: String,
+    obj_id: u32,
 }
 
 fn read_process_maps(pid: u32) -> Result<Vec<ProcessMaps>> {
@@ -583,7 +586,7 @@ fn read_process_maps(pid: u32) -> Result<Vec<ProcessMaps>> {
         let mut parts = toks[0].split('-');
         let vm_start = u64::from_str_radix(parts.next().unwrap(), 16)?;
         let vm_end = u64::from_str_radix(parts.next().unwrap(), 16)?;
-        let perms = toks[1];
+        let perms = toks[1].to_string();
         let offset = u64::from_str_radix(toks[2], 16)?;
         let _dev = toks[3];
         let inode = toks[4].parse::<u64>()?;
@@ -598,10 +601,6 @@ fn read_process_maps(pid: u32) -> Result<Vec<ProcessMaps>> {
         if inode == 0 {
             continue; // skip anonymous mappings
         }
-        if perms.chars().any(|c| c == 'x') {
-            continue; // skip non-executable mappings
-        }
-
         if pathname.is_empty() {
             bail!("pathname for vm_start {:x} is empty", vm_start);
         }
@@ -610,17 +609,41 @@ fn read_process_maps(pid: u32) -> Result<Vec<ProcessMaps>> {
             vm_end,
             offset,
             pathname,
+            perms,
+            obj_id: 0,
         });
     }
 
     Ok(maps)
 }
 
+struct ProcessState {
+    map_tree: BTreeMap<(u32, u64), ProcessMaps>, // (obj_id, offset) -> mapping
+}
+
+impl ProcessState {
+    fn add_to_map_tree(&mut self, obj_id: u32, addr: u64, size: u64) {
+        let key = (obj_id, addr);
+        let Some(entry) = self.map_tree.range(..=&key).rev().next() else {
+            panic!("no mapping found for obj_id {} addr {:#x}", obj_id, addr);
+        };
+        let map_sz = entry.1.vm_end - entry.1.vm_start;
+        if entry.1.offset + map_sz <= addr {
+            panic!("no mapping found for obj_id {} addr {:#x}", obj_id, addr);
+        }
+        println!("Mapping addr {:#x} size {:#x} to obj_id {} offset {:#x}",
+            addr, size, obj_id, entry.1.offset);
+        assert_eq!(entry.0.0, obj_id);
+        assert!(entry.1.offset <= addr);
+        assert!(entry.1.offset + map_sz >= addr + size);
+    }
+}
+
 // XXX TODO
 // - distinguish between expected and unexpected errors
 // - collect all parsing errors
-fn build_fsw(map: &ProcessMaps) -> Result<Fsw> {
-    let path = std::path::PathBuf::from(&map.pathname);
+fn build_fsw(state: &mut ProcessState, obj_id: u32, pathname: &str) -> Result<Fsw> {
+    let path = std::path::PathBuf::from(&pathname);
     let file = File::open(path).context("Could not open file.")?;
     let mut elf = ElfStream::<AnyEndian, _>::open_stream(&file)
         .context("Could not parse ELF file.")?;
@@ -681,6 +704,7 @@ fn build_fsw(map: &ProcessMaps) -> Result<Fsw> {
             // CIE
             let cie = parse_eh_cie(&eh[offset..frame_end], pc, dwarf64)
                 .context("could not parse CIE")?;
+            assert_eq!(cie.rar, 16); // x86_64 return address register
             debug!("parsed eh CIE: {:?}, id_offset {}", cie, id_offset);
             cies.insert(id_offset as u64, cie);
         } else if id == 0xffffffff {
@@ -695,10 +719,14 @@ fn build_fsw(map: &ProcessMaps) -> Result<Fsw> {
             let fde = parse_fde(&eh[offset..frame_end], pc, dwarf64, &cie)
                 .context("could not parse FDE")?;
             debug!("parsed eh FDE: {:?}", fde);
+            state.add_to_map_tree(obj_id, fde.initial_location, fde.address_range);
+            println!("parsed eh FDE: {:?}", fde);
+            /*
             let res = execute_fde(&mut fsw, &fde, &cie);
             if let Err(e) = res {
                 warn!("error executing FDE at offset {}: {:?}", offset, e);
             }
+            */
         }
         if offset > frame_end {
             bail!("consume more than the frame");
@@ -765,22 +793,39 @@ fn main() -> Result<()> {
     env_logger::init();
 
     let pid: u32 = 3961;
+    let mut state = ProcessState {
+        map_tree: BTreeMap::new(),
+    };
 
     // read process maps from /proc/[pid]/maps
-    let maps = read_process_maps(pid)?;
+    let mut maps = read_process_maps(pid)?;
 
-
-    // find all binaries and build unwind tables
+    // order all mappings into a btree map
     let mut objlist = BTreeMap::new();
     let mut next_id = 1u32;
+    for map in maps.iter_mut() {
+        let id = match objlist.get(&map.pathname) {
+            Some(id) => *id,
+            None => {
+                let id = next_id;
+                objlist.insert(map.pathname.clone(), next_id);
+                println!("Object ID {}: {}", next_id, map.pathname);
+                next_id += 1;
+                id
+            },
+        };
+        map.obj_id = id;
+        state.map_tree.insert((id, map.offset), map.clone());
+    }
+
+    // find all binaries and build unwind tables
     for map in maps.iter() {
-        if objlist.contains_key(&map.pathname) {
-            continue; // already processed
+        if map.perms.chars().any(|c| c == 'x') {
+            continue; // skip non-executable mappings
         }
-        objlist.insert(map.pathname.clone(), next_id);
-        next_id += 1;
-        println!("Object ID {}: {}", next_id, map.pathname);
-        let fsw = build_fsw(&map);
+
+        println!("Build fsw for {}", map.pathname);
+        let fsw = build_fsw(&mut state, map.obj_id, &map.pathname);
         match fsw {
             Ok(_) => {
                 println!("Successfully built FSW for {}", map.pathname);
