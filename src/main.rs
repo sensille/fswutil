@@ -629,7 +629,7 @@ impl ProcessState {
         let mut found = false;
         for map in entry.iter() {
             let len = map.vm_end - map.vm_start;
-            if addr >= map.offset && addr + size <= map.offset + len {
+            if addr >= map.offset && addr + size < map.offset + len {
                 debug!("Mapping addr {:#x} size {:#x} to obj_id {} offset {:#x}",
                     addr, size, obj_id, map.offset + (addr - map.vm_start));
                 self.maps.insert(map.clone());
@@ -934,6 +934,10 @@ fn main() -> Result<()> {
         skel.maps.offsetmaps.update(&offsetmap_idx.to_le_bytes(), &m_om, MapFlags::ANY)?;
     }
 
+    for (i, start) in offsetmap_starts.iter().enumerate() {
+        println!("Offsetmap {} starts at obj_id {} addr {:#x}", i, start.0, start.1);
+    }
+
     // build mappings table
     let pid_b = pid.to_le_bytes();
     let mut m = types::mapping {
@@ -942,20 +946,34 @@ fn main() -> Result<()> {
     let mut map_idx = 0;
     for map in state.maps.iter() {
         // find offsetmap
-        let o = match offsetmap_starts.binary_search(&(map.obj_id, map.vm_start)) {
-            Ok(i) => i as u32,
-            Err(0) => {
-                bail!("no offsetmap found for obj_id {} addr {:#x}", map.obj_id, map.vm_start);
+        let mut o = match offsetmap_starts.binary_search(&(map.obj_id, map.offset)) {
+            Ok(i) => i,
+            Err(0) => 0,
+            Err(i) => i - 1,
+        };
+        let mut vm_start = map.vm_start;
+        let mut offset = map.offset;
+        debug!("Building mappings for obj_id {} map {:#x}-{:#x} -> {:#x}",
+            map.obj_id, map.vm_start, map.vm_end, map.offset);
+        while vm_start < map.vm_end {
+            m.mappings[map_idx] = types::map_entry {
+                vma_start: vm_start,
+                obj_id_offset: map.obj_id << 48 | offset,
+                offsetmap_id: o as u32,
+            };
+            println!("Mapping idx {}: obj_id {} addr {:#x}-{:#x} offset {:#x} to offsetmap {}",
+                map_idx, map.obj_id, vm_start, map.vm_end, offset, o);
+            map_idx += 1;
+            let Some(next) = offsetmap_starts.get(o + 1) else {
+                break;
+            };
+            if next.0 != map.obj_id {
+                break;
             }
-            Err(i) => (i - 1) as u32,
-        };
-        println!("Mapping idx {}: obj_id {} addr {:#x} to offsetmap {}", map_idx, map.obj_id, map.vm_start, o);
-        m.mappings[map_idx] = types::map_entry {
-            vma_start: map.vm_start,
-            obj_id_offset: map.obj_id << 48 | (map.offset & 0xffffffffffff),
-            offsetmap_id: o,
-        };
-        map_idx += 1;
+            vm_start += next.1 - offset;
+            offset = next.1;
+            o += 1;
+        }
     }
     let m_b = unsafe {
         std::slice::from_raw_parts(
