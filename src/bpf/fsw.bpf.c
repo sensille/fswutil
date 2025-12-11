@@ -22,6 +22,13 @@ struct {
 	__type(value, struct mapping);
 } mappings SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);		/* adjusted by user mode */
+	__type(key, uint32_t);
+	__type(value, struct offsetmap);
+} offsetmaps SEC(".maps");
+
 static long
 vma_cb(struct task_struct *task, struct vm_area_struct *vma, void *ctx)
 {
@@ -30,45 +37,45 @@ vma_cb(struct task_struct *task, struct vm_area_struct *vma, void *ctx)
 	return 0;
 }
 
+// see https://lore.kernel.org/bpf/874jci5l3f.fsf@taipei.mail-host-address-is-not-set/
+static uint32_t __attribute__((optnone)) scramble(uint32_t val) {
+        return val ^ 0xFFFFFFFF;
+}
+
 static void
 find_mapping(struct mapping *m, uint64_t ip)
 {
 	int i;
-	int n = m->nmappings;
+	uint32_t n = m->nmappings;
 	if (n > MAX_MAPPINGS)
 		n = MAX_MAPPINGS;
 
-#if 0
-	for (i = 0; i < n; ++i) {
-		struct map_entry *me = &m->mappings[i];
-		if (ip >= me->vma_start && ip < me->vma_end) {
-			bpf_printk("ip %lx found in mapping %d: %lx-%lx obj %d off %lx\n",
-				ip, i, me->vma_start, me->vma_end, me->obj_id, me->offset);
-			return;
-		}
-	}
-#else
-	int left = 0;
-	int right = n - 1;
+	uint32_t left = 0;
+	uint32_t right = n - 1;
+	uint32_t mid = 0;
 	for (i = 0; i < MAX_MAPPINGS_BISECT_STEPS && left <= right; ++i) {
-		unsigned int mid = left + (right - left) / 2;
+		mid = left + (right - left) / 2;
+		// XXX TODO expensive
+		mid = scramble(scramble(mid));
 		if (mid >= MAX_MAPPINGS)
 			break;
 		struct map_entry *me = &m->mappings[mid];
-		if (ip < me->vma_start) {
+
+		if (ip < me->vma_start)
 			right = mid - 1;
-		} else if (ip >= me->vma_end) {
+		else if (ip >= me->vma_start)
 			left = mid + 1;
-		} else {
-			bpf_printk("ip %lx found in mapping %d: %lx-%lx obj %d off %lx\n",
-				ip, mid, me->vma_start, me->vma_end, me->obj_id, me->offset);
-			return;
-		}
 	}
-#endif
-
-	bpf_printk("ip %lx not found in any mapping\n", ip);
-
+	if (mid >= MAX_MAPPINGS)
+		return;
+	struct map_entry *me = &m->mappings[mid];
+	bpf_printk("ip %lx found in mapping %d: %lx obj %d off %lx map %d",
+		ip, mid, me->vma_start, me->obj_id_offset >> 48,
+		me->obj_id_offset & 0xffffffffffff, me->offsetmap_id);
+	if (mid + 1 < n) {
+		me = &m->mappings[mid + 1];
+		bpf_printk("next map starts at %lx", me->vma_start);
+	}
 }
 
 SEC("perf_event")
@@ -169,5 +176,6 @@ int BPF_KPROBE(uprobe_add)
 
 #endif
 
+	bpf_printk("\n");
 	return 0;
 }

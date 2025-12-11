@@ -856,6 +856,8 @@ fn main() -> Result<()> {
     println!("  Total unique CFTs: {}", state.cft_forw.len());
     println!("  Total CFT entries: {}", state.entries.len());
 
+
+
     let mut skel_builder = FswSkelBuilder::default();
     skel_builder.obj_builder.debug(true);
 
@@ -880,21 +882,80 @@ fn main() -> Result<()> {
         .expect("`uprobe_add` program is not loaded");
     */
 
-    // Begin tracing
+    let om_entries = 130000;
+    //let om_entries = std::mem::size_of::<types::offsetmap.entries>();
+    let noffsetmaps = (state.entries.len() + om_entries - 1) / om_entries;
+    open_skel.maps.offsetmaps.set_max_entries(noffsetmaps as u32)?;
+    open_skel.maps.mappings.set_max_entries(1)?;
+
     let mut skel = open_skel.load()
         .context("failed to load FSW skel")?;
 
+    // build offsets tables
+    let mut om = types::offsetmap {
+        ..Default::default()
+    };
+    let mut offsetmap_idx = 0u32;
+    let mut entry_idx = 0;
+    let mut offsetmap_starts = Vec::new();
+    for ((id, offset), cft_id) in state.entries.iter() {
+        om.entries[entry_idx] = types::offsetmap_entry {
+            obj_id_offset: *id << 48 | (*offset & 0xffffffffffff),
+            cft_id: cft_id.unwrap_or(0) as u32,
+        };
+        if entry_idx == 0 {
+            offsetmap_starts.push((*id, *offset));
+        }
+        entry_idx += 1;
+        if entry_idx == om_entries {
+            om.nentries = entry_idx as u64;
+            let m_om = unsafe {
+                std::slice::from_raw_parts(
+                    (&om as *const types::offsetmap) as *const u8,
+                    std::mem::size_of::<types::offsetmap>(),
+                )
+            };
+            println!("Updating offsetmap idx {} with {} entries", offsetmap_idx, entry_idx);
+            skel.maps.offsetmaps.update(&offsetmap_idx.to_le_bytes(), &m_om, MapFlags::ANY)?;
+            entry_idx = 0;
+            om = types::offsetmap { .. Default::default()  };
+            offsetmap_idx += 1;
+        }
+    }
+    if entry_idx != 0 {
+        om.nentries = entry_idx as u64;
+        let m_om = unsafe {
+            std::slice::from_raw_parts(
+                (&om as *const types::offsetmap) as *const u8,
+                std::mem::size_of::<types::offsetmap>(),
+            )
+        };
+        println!("Updating offsetmap idx {} with {} entries", offsetmap_idx, entry_idx);
+        skel.maps.offsetmaps.update(&offsetmap_idx.to_le_bytes(), &m_om, MapFlags::ANY)?;
+    }
+
+    // build mappings table
     let pid_b = pid.to_le_bytes();
     let mut m = types::mapping {
         nmappings: state.maps.len() as u64,
         ..Default::default() };
-    for (i, map) in state.maps.iter().enumerate() {
-        m.mappings[i] = types::map_entry {
-            obj_id: map.obj_id,
-            vma_start: map.vm_start,
-            vma_end: map.vm_end,
-            offset: map.offset,
+    let mut map_idx = 0;
+    for map in state.maps.iter() {
+        // find offsetmap
+        let o = match offsetmap_starts.binary_search(&(map.obj_id, map.vm_start)) {
+            Ok(i) => i as u32,
+            Err(0) => {
+                bail!("no offsetmap found for obj_id {} addr {:#x}", map.obj_id, map.vm_start);
+            }
+            Err(i) => (i - 1) as u32,
         };
+        println!("Mapping idx {}: obj_id {} addr {:#x} to offsetmap {}", map_idx, map.obj_id, map.vm_start, o);
+        m.mappings[map_idx] = types::map_entry {
+            vma_start: map.vm_start,
+            obj_id_offset: map.obj_id << 48 | (map.offset & 0xffffffffffff),
+            offsetmap_id: o,
+        };
+        map_idx += 1;
     }
     let m_b = unsafe {
         std::slice::from_raw_parts(
