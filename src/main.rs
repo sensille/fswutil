@@ -2,7 +2,7 @@ use std::fs::File;
 use anyhow::{Result, bail, Context};
 use elf::ElfStream;
 use elf::endian::AnyEndian;
-use std::collections::BTreeMap;
+use std::collections::{ BTreeMap, BTreeSet, HashMap };
 use log::{debug, info, warn};
 use std::io::BufRead;
 use libbpf_rs::skel::OpenSkel;
@@ -566,14 +566,14 @@ fn parse_fde(data: &[u8], pc: u64, dwarf64: bool, cie: &Cie) -> Result<Fde> {
     })
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
 struct ProcessMaps {
     vm_start: u64,
     vm_end: u64,
     offset: u64,
     pathname: String,
     perms: String,
-    obj_id: u32,
+    obj_id: u64,
 }
 
 fn read_process_maps(pid: u32) -> Result<Vec<ProcessMaps>> {
@@ -617,32 +617,36 @@ fn read_process_maps(pid: u32) -> Result<Vec<ProcessMaps>> {
     Ok(maps)
 }
 
+#[derive(Debug)]
 struct ProcessState {
-    map_tree: BTreeMap<(u32, u64), ProcessMaps>, // (obj_id, offset) -> mapping
+    maps_by_id: HashMap<u64, Vec<ProcessMaps>>, // (obj_id, offset) -> mapping
+    maps: BTreeSet<ProcessMaps>,
 }
 
 impl ProcessState {
-    fn add_to_map_tree(&mut self, obj_id: u32, addr: u64, size: u64) {
-        let key = (obj_id, addr);
-        let Some(entry) = self.map_tree.range(..=&key).rev().next() else {
-            panic!("no mapping found for obj_id {} addr {:#x}", obj_id, addr);
-        };
-        let map_sz = entry.1.vm_end - entry.1.vm_start;
-        if entry.1.offset + map_sz <= addr {
-            panic!("no mapping found for obj_id {} addr {:#x}", obj_id, addr);
+    fn add_to_map_tree(&mut self, obj_id: u64, addr: u64, size: u64) -> Result<()> {
+        let entry = self.maps_by_id.get(&obj_id).expect("obj_id should exist");
+        let mut found = false;
+        for map in entry.iter() {
+            let len = map.vm_end - map.vm_start;
+            if addr >= map.offset && addr + size <= map.offset + len {
+                debug!("Mapping addr {:#x} size {:#x} to obj_id {} offset {:#x}",
+                    addr, size, obj_id, map.offset + (addr - map.vm_start));
+                self.maps.insert(map.clone());
+                found = true;
+            }
         }
-        println!("Mapping addr {:#x} size {:#x} to obj_id {} offset {:#x}",
-            addr, size, obj_id, entry.1.offset);
-        assert_eq!(entry.0.0, obj_id);
-        assert!(entry.1.offset <= addr);
-        assert!(entry.1.offset + map_sz >= addr + size);
+        if !found {
+            bail!("no mapping found for obj_id {} addr {:#x} in {:x?}", obj_id, addr, entry);
+        }
+        Ok(())
     }
 }
 
 // XXX TODO
 // - distinguish between expected and unexpected errors
 // - collect all parsing errors
-fn build_fsw(state: &mut ProcessState, obj_id: u32, pathname: &str) -> Result<Fsw> {
+fn build_fsw(state: &mut ProcessState, obj_id: u64, pathname: &str) -> Result<Fsw> {
     let path = std::path::PathBuf::from(&pathname);
     let file = File::open(path).context("Could not open file.")?;
     let mut elf = ElfStream::<AnyEndian, _>::open_stream(&file)
@@ -719,8 +723,7 @@ fn build_fsw(state: &mut ProcessState, obj_id: u32, pathname: &str) -> Result<Fs
             let fde = parse_fde(&eh[offset..frame_end], pc, dwarf64, &cie)
                 .context("could not parse FDE")?;
             debug!("parsed eh FDE: {:?}", fde);
-            state.add_to_map_tree(obj_id, fde.initial_location, fde.address_range);
-            println!("parsed eh FDE: {:?}", fde);
+            state.add_to_map_tree(obj_id, fde.initial_location, fde.address_range)?;
             /*
             let res = execute_fde(&mut fsw, &fde, &cie);
             if let Err(e) = res {
@@ -794,7 +797,8 @@ fn main() -> Result<()> {
 
     let pid: u32 = 3961;
     let mut state = ProcessState {
-        map_tree: BTreeMap::new(),
+        maps_by_id: HashMap::new(),
+        maps: BTreeSet::new(),
     };
 
     // read process maps from /proc/[pid]/maps
@@ -802,7 +806,7 @@ fn main() -> Result<()> {
 
     // order all mappings into a btree map
     let mut objlist = BTreeMap::new();
-    let mut next_id = 1u32;
+    let mut next_id = 1u64;
     for map in maps.iter_mut() {
         let id = match objlist.get(&map.pathname) {
             Some(id) => *id,
@@ -815,14 +819,21 @@ fn main() -> Result<()> {
             },
         };
         map.obj_id = id;
-        state.map_tree.insert((id, map.offset), map.clone());
+        let entry = state.maps_by_id.entry(id).or_insert_with(Vec::new);
+        entry.push(map.clone());
     }
 
+    println!("maps_by_id: {:?}", state.maps_by_id);
     // find all binaries and build unwind tables
-    for map in maps.iter() {
+    let mut built_maps = vec![false; next_id as usize];
+    for map in maps.iter_mut() {
         if map.perms.chars().any(|c| c == 'x') {
             continue; // skip non-executable mappings
         }
+        if built_maps[map.obj_id as usize] {
+            continue; // already built
+        }
+        built_maps[map.obj_id as usize] = true;
 
         println!("Build fsw for {}", map.pathname);
         let fsw = build_fsw(&mut state, map.obj_id, &map.pathname);
@@ -834,6 +845,12 @@ fn main() -> Result<()> {
                 println!("Error building FSW for {}: {:?}", map.pathname, e);
             }
         }
+    }
+
+    println!("needed mappings ({} total):", state.maps.len());
+    for map in state.maps.iter() {
+        println!("  obj_id {}: {:#x}-{:#x} {:#x} {}",
+            map.obj_id, map.vm_start, map.vm_end, map.offset, map.pathname);
     }
 
     let mut skel_builder = FswSkelBuilder::default();
@@ -866,11 +883,17 @@ fn main() -> Result<()> {
 
     let pid_b = pid.to_le_bytes();
     let value = [0u8; 1];
-    let m = types::mapping {
-        nmappings: 1,
-        //mappings: [0u64; 500],
-        ..Default::default()
-    };
+    let mut m = types::mapping {
+        nmappings: state.maps.len() as u64,
+        ..Default::default() };
+    for (i, map) in state.maps.iter().enumerate() {
+        m.mappings[i] = types::map_entry {
+            obj_id: map.obj_id,
+            vma_start: map.vm_start,
+            vma_end: map.vm_end,
+            offset: map.offset,
+        };
+    }
     let m_b = unsafe {
         std::slice::from_raw_parts(
             (&m as *const types::mapping) as *const u8,
@@ -878,7 +901,7 @@ fn main() -> Result<()> {
         )
     };
 
-    let mappings = skel.maps.mappings.update(&pid_b, &m_b, MapFlags::ANY);
+    skel.maps.mappings.update(&pid_b, &m_b, MapFlags::ANY)?;
 
     let pefds = init_perf_monitor(7, false)
         .context("failed to initialize perf monitor")?;

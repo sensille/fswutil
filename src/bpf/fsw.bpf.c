@@ -30,6 +30,47 @@ vma_cb(struct task_struct *task, struct vm_area_struct *vma, void *ctx)
 	return 0;
 }
 
+static void
+find_mapping(struct mapping *m, uint64_t ip)
+{
+	int i;
+	int n = m->nmappings;
+	if (n > MAX_MAPPINGS)
+		n = MAX_MAPPINGS;
+
+#if 0
+	for (i = 0; i < n; ++i) {
+		struct map_entry *me = &m->mappings[i];
+		if (ip >= me->vma_start && ip < me->vma_end) {
+			bpf_printk("ip %lx found in mapping %d: %lx-%lx obj %d off %lx\n",
+				ip, i, me->vma_start, me->vma_end, me->obj_id, me->offset);
+			return;
+		}
+	}
+#else
+	int left = 0;
+	int right = n - 1;
+	for (i = 0; i < MAX_MAPPINGS_BISECT_STEPS && left <= right; ++i) {
+		unsigned int mid = left + (right - left) / 2;
+		if (mid >= MAX_MAPPINGS)
+			break;
+		struct map_entry *me = &m->mappings[mid];
+		if (ip < me->vma_start) {
+			right = mid - 1;
+		} else if (ip >= me->vma_end) {
+			left = mid + 1;
+		} else {
+			bpf_printk("ip %lx found in mapping %d: %lx-%lx obj %d off %lx\n",
+				ip, mid, me->vma_start, me->vma_end, me->obj_id, me->offset);
+			return;
+		}
+	}
+#endif
+
+	bpf_printk("ip %lx not found in any mapping\n", ip);
+
+}
+
 SEC("perf_event")
 int BPF_KPROBE(uprobe_add)
 {
@@ -124,6 +165,7 @@ int BPF_KPROBE(uprobe_add)
 		return 0;
 	}
 	bpf_printk("nmappings %d", m->nmappings);
+	find_mapping(m, regs[16]);
 
 #endif
 
