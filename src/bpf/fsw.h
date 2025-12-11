@@ -7,18 +7,21 @@
 #define MAX_OFFSETS	130000
 #define MAX_OFFSETS_BISECT_STEPS	17
 
+#define MAX_CFT_ENTRIES	1000
+
+#define MAX_EXPRESSION_LEN 255
+#define NUM_REGISTERS 17		// 16 + RIP
+
 #pragma pack(1)
 struct mapping {
-	uint64_t	nmappings;
+	uint64_t	nentries;
 	struct map_entry {
 		uint64_t	vma_start;
 		uint64_t	obj_id_offset;
 		uint32_t	offsetmap_id;
-	} mappings[MAX_MAPPINGS];
+	} entries[MAX_MAPPINGS];
 };
-#pragma pack()
 
-#pragma pack(1)
 struct offsetmap {
 	uint64_t	nentries;
 	struct offsetmap_entry {
@@ -26,6 +29,58 @@ struct offsetmap {
 		uint32_t	cft_id;
 	} entries[MAX_OFFSETS];
 };
+
+enum register_rule_type {
+    REGISTER_RULE_UNINITIALIZED = 0,
+    REGISTER_RULE_UNDEFINED = 1,
+    REGISTER_RULE_SAME_VALUE = 2,
+    REGISTER_RULE_OFFSET = 3,
+    REGISTER_RULE_VAL_OFFSET = 4,
+    REGISTER_RULE_REGISTER = 5,
+    REGISTER_RULE_EXPRESSION = 6,
+    REGISTER_RULE_VAL_EXPRESSION = 7,
+};
+
+struct register_rule {
+    enum register_rule_type	rtype;
+    union register_rule_data {
+	uint64_t	reg;
+	int64_t		offset;
+	uint32_t	expression_id;
+    } data;
+};
+
+enum cfa_rule_type {
+    CFA_RULE_UNINITIALIZED = 0,
+    CFA_RULE_REG_OFFSET = 1,
+    CFA_RULE_EXPRESSION = 2,
+};
+
+struct cfa_rule {
+    enum cfa_rule_type	rtype;
+    union cfa_rule_data {
+	struct reg_offset {
+		uint8_t		reg;
+		int64_t		offset;
+	} reg_offset;
+	uint32_t	expression_id;
+    } data;
+};
+
+struct cft {
+	uint64_t	nentries;
+	struct cft_entry {
+		struct cfa_rule cfa;
+		struct register_rule rules[NUM_REGISTERS];
+		uint64_t arg_size;
+	} entries[MAX_CFT_ENTRIES];
+};
+
+struct expression {
+	uint8_t ninstructions;
+	uint8_t instructions[MAX_EXPRESSION_LEN];
+};
+
 #pragma pack()
 
 //

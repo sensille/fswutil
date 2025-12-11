@@ -8,8 +8,7 @@ use std::io::BufRead;
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
-use libbpf_rs::MapCore;
-use libbpf_rs::MapFlags;
+use libbpf_rs::{ MapCore, MapFlags, MapImpl, Mut };
 use std::default::Default;
 
 mod fsw {
@@ -785,6 +784,28 @@ fn attach_perf_event(
         .collect()
 }
 
+fn set_expression_in_map(map: &mut MapImpl<'_, Mut>, expr_id: u32, expr: &Vec<u8>) -> Result<()> {
+    if expr.len() > 255 /* XXX hardcoded */ {
+        bail!("expression too long");
+    }
+    let mut e = types::expression {
+        ninstructions: expr.len() as u8,
+        instructions: [0u8; 255],
+    };
+    e.instructions[..expr.len()].copy_from_slice(&expr);
+    let e_b = unsafe {
+        std::slice::from_raw_parts(
+            (&e as *const types::expression) as *const u8,
+            std::mem::size_of::<types::expression>(),
+        )
+    };
+
+    // XXX to_le_bytes is too specific
+    map.update(&expr_id.to_le_bytes(), &e_b, MapFlags::ANY)?;
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     env_logger::init();
 
@@ -887,6 +908,21 @@ fn main() -> Result<()> {
     let noffsetmaps = (state.entries.len() + om_entries - 1) / om_entries;
     open_skel.maps.offsetmaps.set_max_entries(noffsetmaps as u32)?;
     open_skel.maps.mappings.set_max_entries(1)?;
+    open_skel.maps.cfts.set_max_entries(state.cft_forw.len() as u32)?;
+    // count expresions
+    let mut nexpr = 0;
+    for (_, cft) in state.cft_forw.iter() {
+        if let CFARule::Expression(_) = &cft.cfa {
+            nexpr += 1;
+        }
+        for rule in cft.rules.iter() {
+            if let RegisterRule::Expression(_) = rule {
+                nexpr += 1;
+            }
+        }
+    }
+    open_skel.maps.expressions.set_max_entries(nexpr)?;
+    println!("Have {} expressions", nexpr);
 
     let mut skel = open_skel.load()
         .context("failed to load FSW skel")?;
@@ -941,7 +977,7 @@ fn main() -> Result<()> {
     // build mappings table
     let pid_b = pid.to_le_bytes();
     let mut m = types::mapping {
-        nmappings: state.maps.len() as u64,
+        nentries: state.maps.len() as u64,
         ..Default::default() };
     let mut map_idx = 0;
     for map in state.maps.iter() {
@@ -956,7 +992,7 @@ fn main() -> Result<()> {
         debug!("Building mappings for obj_id {} map {:#x}-{:#x} -> {:#x}",
             map.obj_id, map.vm_start, map.vm_end, map.offset);
         while vm_start < map.vm_end {
-            m.mappings[map_idx] = types::map_entry {
+            m.entries[map_idx] = types::map_entry {
                 vma_start: vm_start,
                 obj_id_offset: map.obj_id << 48 | offset,
                 offsetmap_id: o as u32,
@@ -983,6 +1019,79 @@ fn main() -> Result<()> {
     };
 
     skel.maps.mappings.update(&pid_b, &m_b, MapFlags::ANY)?;
+
+    // build CFT table
+    let mut expr_id = 0u32;
+    for (cft_id, cft) in state.cft_forw.iter() {
+        let mut m_cft = types::cft_entry {
+            arg_size: cft.arg_size,
+            ..Default::default()
+        };
+
+        // cfa
+        match &cft.cfa {
+            CFARule::Uninitialized => {
+                m_cft.cfa.rtype = types::cfa_rule_type::CFA_RULE_UNINITIALIZED;
+            }
+            CFARule::Expression(expr) => {
+                m_cft.cfa.rtype = types::cfa_rule_type::CFA_RULE_EXPRESSION;
+                m_cft.cfa.data.expression_id = expr_id;
+                set_expression_in_map(&mut skel.maps.expressions, expr_id, expr)?;
+                expr_id += 1;
+            }
+            CFARule::RegOffset(r, o) => {
+                m_cft.cfa.rtype = types::cfa_rule_type::CFA_RULE_REG_OFFSET;
+                m_cft.cfa.data.reg_offset.reg = *r as u8;
+                m_cft.cfa.data.reg_offset.offset = *o;
+            }
+        }
+        // registers
+        for (reg, rule) in cft.rules.iter().enumerate() {
+            match rule {
+                RegisterRule::Uninitialized => {
+                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_UNINITIALIZED;
+                }
+                RegisterRule::SameValue => {
+                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_SAME_VALUE;
+                }
+                RegisterRule::Undefined => {
+                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_UNDEFINED;
+                }
+                RegisterRule::Offset(o) => {
+                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_OFFSET;
+                    m_cft.rules[reg].data.offset = *o;
+                }
+                RegisterRule::ValOffset(o) => {
+                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_VAL_OFFSET;
+                    m_cft.rules[reg].data.offset = *o;
+                }
+                RegisterRule::Register(r) => {
+                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_REGISTER;
+                    m_cft.rules[reg].data.reg = *r as u64;
+                }
+                RegisterRule::Expression(expr) => {
+                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_EXPRESSION;
+                    m_cft.rules[reg].data.expression_id = expr_id;
+                    set_expression_in_map(&mut skel.maps.expressions, expr_id, expr)?;
+                    expr_id += 1;
+                }
+                RegisterRule::ValExpression(expr) => {
+                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_VAL_EXPRESSION;
+                    m_cft.rules[reg].data.expression_id = expr_id;
+                    set_expression_in_map(&mut skel.maps.expressions, expr_id, expr)?;
+                    expr_id += 1;
+                }
+            }
+        }
+        let r_b = unsafe {
+            std::slice::from_raw_parts(
+                (&m_cft as *const types::cft_entry) as *const u8,
+                std::mem::size_of::<types::cft_entry>(),
+            )
+        };
+
+        skel.maps.cfts.update(&cft_id.to_le_bytes(), &r_b, MapFlags::ANY)?;
+    }
 
     let pefds = init_perf_monitor(7, false)
         .context("failed to initialize perf monitor")?;
