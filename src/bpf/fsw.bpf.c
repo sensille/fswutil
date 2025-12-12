@@ -10,8 +10,8 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 const volatile uint32_t targ_pid = 0;
 
-#define LOG(...) bpf_printk(__VA_ARGS__)
-#define DBG(...) bpf_printk(__VA_ARGS__)
+#define LOG(...) // bpf_printk(__VA_ARGS__)
+#define DBG(...) // bpf_printk(__VA_ARGS__)
 
 /*
  * maps
@@ -157,84 +157,94 @@ find_cft(struct offsetmap *om, uint16_t obj_id, uint64_t offset)
 	return ome;
 }
 
+struct fsw_state {
+	struct mapping *m;
+	u64 regs[NUM_REGISTERS];
+	u64 regs_valid;
+	int steps;
+};
+
 static int
-unwind_step(struct mapping *m, u64 *regs, u64 *regs_valid) {
-	if ((*regs_valid & (1 << RIP)) == 0) {
+unwind_step(int ix, struct fsw_state *s) {
+	if ((s->regs_valid & (1 << RIP)) == 0) {
 		LOG("Stack walk: PC is None, stopping");
-		return -1;
+		return 1;
 	}
 
-	struct map_entry *me = find_mapping(m, regs[RIP]);
+	struct map_entry *me = find_mapping(s->m, s->regs[RIP]);
 	if (me == NULL) {
 		LOG("no map entry found");
-		return -1;
+		return 1;
 	}
 
 	struct offsetmap *om = bpf_map_lookup_elem(&offsetmaps, &me->offsetmap_id);
 	if (om == NULL) {
 		LOG("offsetmap not found");
-		return -1;
+		return 1;
 	}
-	uint64_t offset = regs[RIP] - me->vma_start + (me->obj_id_offset & 0xffffffffffff);
-	bpf_printk("rip %lx vma_start %lx offset %lx", regs[RIP], me->vma_start, offset);
+	uint64_t offset = s->regs[RIP] - me->vma_start + (me->obj_id_offset & 0xffffffffffff);
+	DBG("rip %lx vma_start %lx offset %lx", s->regs[RIP], me->vma_start, offset);
 	struct offsetmap_entry *ome = find_cft(om, me->obj_id_offset >> 48, offset);
 	if (ome == NULL) {
 		LOG("no offsetmap entry found");
-		return -1;
+		return 1;
 	}
 
 	struct cft *cf = bpf_map_lookup_elem(&cfts, &ome->cft_id);
 	if (cf == NULL) {
 		LOG("cft not found");
-		return -1;
+		return 1;
 	}
-	bpf_printk("cft %d found", ome->cft_id);
+	LOG("cft %d found", ome->cft_id);
+	if (ome->cft_id == 0) {
+		LOG("no mapping for address");
+		return 1;
+	}
 
 	// XXX only copy when needed, invent a flag in cft
 	u64 old_regs[NUM_REGISTERS];
 	for (int i = 0; i < NUM_REGISTERS; ++i)
-		old_regs[i] = regs[i];
+		old_regs[i] = s->regs[i];
 
 	/* compute CFA */
 	uint64_t cfa;
 	if (cf->cfa.rtype == CFA_RULE_UNINITIALIZED) {
 		LOG("Stack walk: CFA uninitialized, stopping");
-		return -1;
+		return 1;
 	} else if (cf->cfa.rtype == CFA_RULE_EXPRESSION) {
 		LOG("Stack walk: CFA expression not yet supported, stopping");
-		return -1;
+		return 1;
 	} else if (cf->cfa.rtype == CFA_RULE_REG_OFFSET) {
 		u32 r = cf->cfa.data.reg_offset.reg;
 		s64 o = cf->cfa.data.reg_offset.offset;
-		if ((*regs_valid & (1 << r)) == 0) {
+		if ((s->regs_valid & (1 << r)) == 0) {
 			LOG("Stack walk: CFA register r%d not valid, stopping", r);
-			return -1;
+			return 1;
 		}
 		if (r >= NUM_REGISTERS) {
 			LOG("Stack walk: CFA register r%d out of range, stopping", r);
-			return -1;
+			return 1;
 		}
-		cfa = regs[r] + o;
-		bpf_printk("  CFA = r%d (%lx) + %lld = %lx", r, regs[r], o, cfa);
+		cfa = s->regs[r] + o;
+		bpf_printk("  CFA = r%d (%lx) + %lld = %lx", r, s->regs[r], o, cfa);
 	} else {
 		LOG("Stack walk: unknown CFA rule type %d, stopping", cf->cfa.rtype);
-		return -1;
+		return 1;
 	}
 
         // unwind stack pointer
-        regs[RSP] = cfa;
+        s->regs[RSP] = cfa;
 
-#if 1
 	for (int reg = 0; reg < NUM_REGISTERS; ++reg) {
-		*regs_valid = scramble(scramble(*regs_valid));
+		s->regs_valid = scramble(scramble(s->regs_valid));
 		if (cf->rules[reg].rtype == REGISTER_RULE_UNINITIALIZED ||
 		    cf->rules[reg].rtype == REGISTER_RULE_SAME_VALUE) {
 			// register is unchanged
-			bpf_printk("  r%d: same value %lx", reg, regs[reg]);
+			DBG("  r%d: same value %lx", reg, s->regs[reg]);
 		} else if (cf->rules[reg].rtype == REGISTER_RULE_UNDEFINED) {
 			// register is undefined
-			bpf_printk("  r%d: undefined", reg);
-			*regs_valid &= ~(1 << reg);
+			DBG("  r%d: undefined", reg);
+			s->regs_valid &= ~(1 << reg);
 		} else if (cf->rules[reg].rtype == REGISTER_RULE_OFFSET) {
 			// register is at CFA + offset
 			s64 off = cf->rules[reg].data.offset;
@@ -245,29 +255,29 @@ unwind_step(struct mapping *m, u64 *regs, u64 *regs_valid) {
 			if (ret < 0) {
 				LOG("Stack walk: failed to read r%d at addr %lx, stopping",
 					reg, addr);
-				return -1;
+				return 1;
 			}
-			bpf_printk("  r%d: at addr %lx value %lx", reg, addr, val);
-			regs[reg] = val;
-			*regs_valid |= (1 << reg);
+			DBG("  r%d: at addr %lx value %lx", reg, addr, val);
+			s->regs[reg] = val;
+			s->regs_valid |= (1 << reg);
                 // XXX use old_regs for register to register copy
 		} else {
 			LOG("Stack walk: unsupported register rule type %d for r%d, stopping",
 				cf->rules[reg].rtype, reg);
-			return -1;
+			return 1;
 		}
 	}
-#endif
 
-	bpf_printk("After unwind step: next PC %lx", regs[RIP]);
+	bpf_printk("After unwind step: next PC %lx", s->regs[RIP]);
 	for (int reg = 0; reg < NUM_REGISTERS; ++reg) {
-		if (*regs_valid & (1 << reg)) {
-			bpf_printk("  r%d: %lx", reg, regs[reg]);
+		if (s->regs_valid & (1 << reg)) {
+			LOG("  r%d: %lx", reg, s->regs[reg]);
 		} else {
-			bpf_printk("  r%d: <invalid>", reg);
+			LOG("  r%d: <invalid>", reg);
 		}
 	}
 
+	s->steps += 1;
 	return 0;
 }
 
@@ -329,25 +339,25 @@ int BPF_KPROBE(uprobe_add)
 
 	// XXX just read all as a block and sort later?
 	// XXX not all needed for stack walk without params
-	u64 regs[17];
-	regs[0] = BPF_CORE_READ(pregs, ax);
-	regs[1] = BPF_CORE_READ(pregs, dx);
-	regs[2] = BPF_CORE_READ(pregs, cx);
-	regs[3] = BPF_CORE_READ(pregs, bx);
-	regs[4] = BPF_CORE_READ(pregs, si);
-	regs[5] = BPF_CORE_READ(pregs, di);
-	regs[6] = BPF_CORE_READ(pregs, bp);
-	regs[7] = BPF_CORE_READ(pregs, sp);
-	regs[8] = BPF_CORE_READ(pregs, r8);
-	regs[9] = BPF_CORE_READ(pregs, r9);
-	regs[10] = BPF_CORE_READ(pregs, r10);
-	regs[11] = BPF_CORE_READ(pregs, r11);
-	regs[12] = BPF_CORE_READ(pregs, r12);
-	regs[13] = BPF_CORE_READ(pregs, r13);
-	regs[14] = BPF_CORE_READ(pregs, r14);
-	regs[15] = BPF_CORE_READ(pregs, r15);
-	regs[16] = BPF_CORE_READ(pregs, ip);
-	bpf_printk("rsp %lx ip %lx r8 %lx", regs[7], regs[16], regs[8]);
+	struct fsw_state s;
+	s.regs[0] = BPF_CORE_READ(pregs, ax);
+	s.regs[1] = BPF_CORE_READ(pregs, dx);
+	s.regs[2] = BPF_CORE_READ(pregs, cx);
+	s.regs[3] = BPF_CORE_READ(pregs, bx);
+	s.regs[4] = BPF_CORE_READ(pregs, si);
+	s.regs[5] = BPF_CORE_READ(pregs, di);
+	s.regs[6] = BPF_CORE_READ(pregs, bp);
+	s.regs[7] = BPF_CORE_READ(pregs, sp);
+	s.regs[8] = BPF_CORE_READ(pregs, r8);
+	s.regs[9] = BPF_CORE_READ(pregs, r9);
+	s.regs[10] = BPF_CORE_READ(pregs, r10);
+	s.regs[11] = BPF_CORE_READ(pregs, r11);
+	s.regs[12] = BPF_CORE_READ(pregs, r12);
+	s.regs[13] = BPF_CORE_READ(pregs, r13);
+	s.regs[14] = BPF_CORE_READ(pregs, r14);
+	s.regs[15] = BPF_CORE_READ(pregs, r15);
+	s.regs[16] = BPF_CORE_READ(pregs, ip);
+	bpf_printk("rsp %lx ip %lx r8 %lx", s.regs[7], s.regs[16], s.regs[8]);
 
 	bpf_printk("pid %d tgid %d", pid, tgid);
 
@@ -361,19 +371,25 @@ int BPF_KPROBE(uprobe_add)
 		return 0;
 	}
 	bpf_printk("nmappings %d", m->nentries);
+	s.m = m;
+	s.regs_valid = 0x1ffff;
+	s.steps = 0;
 
-	uint64_t regs_valid = 0x1ffff;
-	int i;
-	for (i = 0; i < 8 /*MAX_STACK_FRAMES */; ++i) {
-		regs_valid = scramble(scramble(regs_valid));
-		int ret = unwind_step(m, regs, &regs_valid);
-		if (ret < 0) {
-			LOG("unwind step %d failed", i);
-			break;
-		}
-	}
+#if 0
+	// pre-5.17 without bpf_loop
+	int i = 0;
+	for (; i < 8; ++i)
+		if (unwind_step(i, &s) != 0)
+			goto done;
+	for (; i < 16; ++i)
+		if (unwind_step(i, &s) != 0)
+			goto done;
+#else
+	bpf_loop(MAX_STACK_FRAMES, unwind_step, &s, 0);
+#endif
 
-	bpf_printk("walked %d steps", i);
+done:
+	bpf_printk("walked %d steps", s.steps);
 	bpf_printk("\n");
 	return 0;
 }

@@ -810,6 +810,7 @@ fn main() -> Result<()> {
     env_logger::init();
 
     let pid: u32 = 3961;
+    let pid: u32 = 1096833;
 
     let mut state = ProcessState {
         maps_by_id: HashMap::new(),
@@ -817,7 +818,7 @@ fn main() -> Result<()> {
         entries: BTreeMap::new(),
         cft_forw: BTreeMap::new(),
         cft_rev: BTreeMap::new(),
-        next_id: 0,
+        next_id: 1,
     };
 
     // read process maps from /proc/[pid]/maps
@@ -878,6 +879,18 @@ fn main() -> Result<()> {
     println!("  Total CFT entries: {}", state.entries.len());
 
 
+    /*
+    // dump all entries
+    for ((id, offset), cft_id) in state.entries.iter() {
+        if let Some(cft_id) = cft_id {
+            println!("Entry: obj_id {} offset {:#x} {:#x} cft_id {}",
+                id, offset, (id << 48) | offset, cft_id);
+        } else {
+            println!("Entry: obj_id {} offset {:#x} end",
+                id, offset);
+        }
+    }
+    */
 
     let mut skel_builder = FswSkelBuilder::default();
     skel_builder.obj_builder.debug(true);
@@ -908,7 +921,7 @@ fn main() -> Result<()> {
     let noffsetmaps = (state.entries.len() + om_entries - 1) / om_entries;
     open_skel.maps.offsetmaps.set_max_entries(noffsetmaps as u32)?;
     open_skel.maps.mappings.set_max_entries(1)?;
-    open_skel.maps.cfts.set_max_entries(state.cft_forw.len() as u32)?;
+    open_skel.maps.cfts.set_max_entries(state.cft_forw.len() as u32 + 1)?;
     // count expresions
     let mut nexpr = 0;
     for (_, cft) in state.cft_forw.iter() {
