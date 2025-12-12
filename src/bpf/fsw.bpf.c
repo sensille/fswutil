@@ -12,6 +12,8 @@ const volatile uint32_t targ_pid = 0;
 
 #define LOG(...) // bpf_printk(__VA_ARGS__)
 #define DBG(...) // bpf_printk(__VA_ARGS__)
+#undef SAFETY_CHECK
+#define APPEASE_VERIFIER
 
 /*
  * maps
@@ -88,12 +90,16 @@ find_mapping(struct mapping *m, uint64_t ip)
 		return NULL;
 	}
 	--left;
+#ifdef APPEASE_VERIFIER
+	left = scramble(scramble(left));
+#endif
 	if (left >= MAX_MAPPINGS)
 		return NULL;
 	struct map_entry *me = &m->entries[left];
-	bpf_printk("ip %lx found in mapping %d: %lx obj %d (0x%x) off %lx map %d",
-		ip, left, me->vma_start, me->obj_id_offset >> 48, me->obj_id_offset >> 48,
-		me->obj_id_offset & 0xffffffffffff, me->offsetmap_id);
+	bpf_printk("ip %lx found in mapping %d: %lx", ip, left, me->vma_start);
+	bpf_printk("    obj %d off %lx map %d",
+		me->obj_id_offset >> 48, me->obj_id_offset & 0xffffffffffff, me->offsetmap_id);
+#ifdef SAFETY_CHECK
 	// safety check
 	if (left + 1 < n) {
 		struct map_entry *nme = &m->entries[left + 1];
@@ -103,6 +109,7 @@ find_mapping(struct mapping *m, uint64_t ip)
 			return NULL;
 		}
 	}
+#endif
 	return me;
 }
 
@@ -136,6 +143,9 @@ find_cft(struct offsetmap *om, uint16_t obj_id, uint64_t offset)
 
 	}
 	--left;
+#ifdef APPEASE_VERIFIER
+	left = scramble(scramble(left));
+#endif
 	if (left >= MAX_OFFSETS) {
 		LOG("left %d out of bounds", left);
 		return NULL;
@@ -143,7 +153,9 @@ find_cft(struct offsetmap *om, uint16_t obj_id, uint64_t offset)
 
 	struct offsetmap_entry *ome = &om->entries[left];
 	bpf_printk("key %lx found in offsets %d: %lx ctf %d",
-		key, left, ome->obj_id_offset, ome->cft_id);
+		key, left, ome->obj_id_offset);
+	bpf_printk("    ctf %d", ome->cft_id);
+#ifdef SAFETY_CHECK
 	// safety check
 	if (left + 1 < n) {
 		struct offsetmap_entry *nome = &om->entries[left + 1];
@@ -153,6 +165,7 @@ find_cft(struct offsetmap *om, uint16_t obj_id, uint64_t offset)
 			return NULL;
 		}
 	}
+#endif
 
 	return ome;
 }
@@ -226,7 +239,8 @@ unwind_step(int ix, struct fsw_state *s) {
 			return 1;
 		}
 		cfa = s->regs[r] + o;
-		bpf_printk("  CFA = r%d (%lx) + %lld = %lx", r, s->regs[r], o, cfa);
+		bpf_printk("  CFA = r%d (%lx) + %lld = %lx", r, s->regs[r], o);
+		bpf_printk("  new CFA = %lx", cfa);
 	} else {
 		LOG("Stack walk: unknown CFA rule type %d, stopping", cf->cfa.rtype);
 		return 1;
@@ -375,13 +389,9 @@ int BPF_KPROBE(uprobe_add)
 	s.regs_valid = 0x1ffff;
 	s.steps = 0;
 
-#if 0
+#if 1
 	// pre-5.17 without bpf_loop
-	int i = 0;
-	for (; i < 8; ++i)
-		if (unwind_step(i, &s) != 0)
-			goto done;
-	for (; i < 16; ++i)
+	for (int i = 0; i < 20 /*MAX_STACK_FRAMES*/; ++i)
 		if (unwind_step(i, &s) != 0)
 			goto done;
 #else
