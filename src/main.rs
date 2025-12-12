@@ -8,7 +8,7 @@ use std::io::BufRead;
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
-use libbpf_rs::{ MapCore, MapFlags, MapImpl, Mut };
+use libbpf_rs::{ MapCore, MapFlags, MapImpl, Mut, RingBufferBuilder };
 use std::default::Default;
 
 mod fsw {
@@ -812,7 +812,7 @@ fn main() -> Result<()> {
 
     //let pid: u32 = 463248;
     //let pid: u32 = 3961;
-    let pid: u32 = 1096833;
+    let pid: u32 = 33238;
 
 
     let mut state = ProcessState {
@@ -1141,7 +1141,30 @@ fn main() -> Result<()> {
         .context("failed to attach FSW skel")?;
 
     println!("FSW attached, sleeping...");
-    std::thread::sleep(std::time::Duration::from_secs(100));
 
-    Ok(())
+    #[repr(C)]
+    struct stack_out {
+            nframes: u32,
+            frames: [u64; 64],
+    }
+    let mut rbb = RingBufferBuilder::new();
+    rbb.add(&skel.maps.rb, |data| {
+                assert_eq!(data.len(), std::mem::size_of::<stack_out>());
+                let data = unsafe {
+                    &*(data.as_ptr() as *const stack_out)
+                };
+                println!("nframes {}", data.nframes);
+                for i in 0..data.nframes as usize {
+                    println!("frame {}: {:#x}", i, data.frames[i]);
+                }
+                1
+        })
+        .context("failed to build ring buffer")?;
+    let rb = rbb.build()?;
+    loop {
+        rb.poll(std::time::Duration::from_secs(100))?;
+    }
+    //std::thread::sleep(std::time::Duration::from_secs(100));
+
+    //Ok(())
 }

@@ -46,6 +46,19 @@ struct {
 	__type(value, struct expression);
 } expressions SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 32 * 4096);
+} rb SEC(".maps");
+
+/*
+ * output structure
+ */
+struct stack_out {
+	uint32_t nframes;
+	uint64_t frames[MAX_STACK_FRAMES];
+};
+
 static long
 vma_cb(struct task_struct *task, struct vm_area_struct *vma, void *ctx)
 {
@@ -389,16 +402,27 @@ int BPF_KPROBE(uprobe_add)
 	s.regs_valid = 0x1ffff;
 	s.steps = 0;
 
+	struct stack_out *out = bpf_ringbuf_reserve(&rb, sizeof(*out), 0);
+	if (out == NULL) {
+		LOG("ringbuf reserve failed");
+		return 0;
+	}
 #if 1
 	// pre-5.17 without bpf_loop
-	for (int i = 0; i < 20 /*MAX_STACK_FRAMES*/; ++i)
+	for (int i = 0; i < 20 /*MAX_STACK_FRAMES*/; ++i) {
 		if (unwind_step(i, &s) != 0)
 			goto done;
+		out->frames[i] = s.regs[RIP];
+	}
+
 #else
 	bpf_loop(MAX_STACK_FRAMES, unwind_step, &s, 0);
 #endif
 
 done:
+	out->nframes = s.steps;
+	bpf_ringbuf_submit(out, 0);
+
 	bpf_printk("walked %d steps", s.steps);
 	bpf_printk("\n");
 	return 0;
