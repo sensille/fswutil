@@ -110,6 +110,7 @@ struct ProcessState {
     cft_forw: BTreeMap<u32, CFT>,
     cft_rev: BTreeMap<CFT, u32>,
     next_id: u32,
+    pid: u32,
 }
 
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
@@ -646,7 +647,7 @@ impl ProcessState {
 // - distinguish between expected and unexpected errors
 // - collect all parsing errors
 fn build_fsw(state: &mut ProcessState, obj_id: u64, pathname: &str) -> Result<()> {
-    let path = std::path::PathBuf::from(&pathname);
+    let path = format!("/proc/{}/root/{}", state.pid, pathname);
     let file = File::open(path).context("Could not open file.")?;
     let mut elf = ElfStream::<AnyEndian, _>::open_stream(&file)
         .context("Could not parse ELF file.")?;
@@ -819,6 +820,7 @@ fn main() -> Result<()> {
         cft_forw: BTreeMap::new(),
         cft_rev: BTreeMap::new(),
         next_id: 1,
+        pid,
     };
 
     // read process maps from /proc/[pid]/maps
