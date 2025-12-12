@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+blazesym = "0.2.1"
 elf = "0.8.0"
 env_logger = "0.11.8"
 libbpf-rs = "0.25.0"

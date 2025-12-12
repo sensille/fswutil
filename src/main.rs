@@ -10,6 +10,9 @@ use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::{ MapCore, MapFlags, MapImpl, Mut, RingBufferBuilder };
 use std::default::Default;
+use blazesym::symbolize::source::{ Process, Source };
+use blazesym::symbolize::{ Symbolizer, Symbolized, Input, Sym };
+use blazesym::Pid;
 
 mod fsw {
     include!(concat!(
@@ -113,7 +116,7 @@ struct ProcessState {
     pid: u32,
 }
 
-#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Default)]
 struct ProcessMaps {
     vm_start: u64,
     vm_end: u64,
@@ -1142,20 +1145,63 @@ fn main() -> Result<()> {
 
     println!("FSW attached, sleeping...");
 
+    //let symbolizers: HashMap<u64, symbolize::Symbolizer> = HashMap::new();
+    let src = Source::Process(Process::new(Pid::from(state.pid)));
+    let symbolizer = Symbolizer::new();
+
     #[repr(C)]
-    struct stack_out {
+    struct StackOut {
             nframes: u32,
             frames: [u64; 64],
     }
     let mut rbb = RingBufferBuilder::new();
     rbb.add(&skel.maps.rb, |data| {
-                assert_eq!(data.len(), std::mem::size_of::<stack_out>());
+                assert_eq!(data.len(), std::mem::size_of::<StackOut>());
                 let data = unsafe {
-                    &*(data.as_ptr() as *const stack_out)
+                    &*(data.as_ptr() as *const StackOut)
                 };
                 println!("nframes {}", data.nframes);
                 for i in 0..data.nframes as usize {
-                    println!("frame {}: {:#x}", i, data.frames[i]);
+                    let ip = data.frames[i];
+                    //println!("frame {}: {:#x}", i, ip);
+                    // translate address to mapping and offset
+                    // find map
+                    let key = ProcessMaps {
+                        vm_start: ip,
+                        ..Default::default()
+                    };
+                    let map = state.maps.range(..=key).next_back();
+                    let Some(map) = map else {
+                        println!("  {:#x} no mapping found", ip);
+                        continue;
+                    };
+                    /*
+                    println!("  {:#x} mapped to obj_id {} offset {:#x} in {}",
+                        ip, map.obj_id, map.offset + (ip - map.vm_start), map.pathname);
+                    */
+                    let sym = symbolizer.symbolize_single(&src, Input::AbsAddr(ip));
+                    let s = match sym {
+                        Ok(Symbolized::Sym(s)) => s.name.to_string(),
+                        Ok(Symbolized::Unknown(r)) => r.to_string(),
+                        Err(e) => {
+                            println!("    symbolization error: {:?}", e);
+                            continue;
+                        }
+                    };
+                    println!("   {:#x} {}", ip, s);
+                    /*
+                    let symbolizer = match symbolizers.get(&map.obj_id) {
+                        Some(s) => s,
+                        None => {
+                            let src = symbolize::source::Source::Process(Proformat!("/proc/{}/root{}",
+                                    state.pid, map.pathname));
+                            let symbolizer = symbolize::Symbolizer::new();
+                                format!("/proc/{}/root{}", state.pid, map.pathname)
+                            ).context("failed to create symbolizer")?;
+                            continue;
+                        }
+                    };
+                    */
                 }
                 1
         })
