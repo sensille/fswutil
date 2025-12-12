@@ -757,22 +757,22 @@ fn init_perf_monitor(freq: u64, sw_event: bool) -> Result<Vec<i32>> {
         flags: 1 << 10, // freq = 1
         ..Default::default()
     };
-    (0..nprocs)
-        .map(|cpu| {
-            let fd = syscall::perf_event_open(&attr, pid, cpu as i32, -1, 0) as i32;
-            if fd == -1 {
-                let mut error_context = "Failed to open perf event.";
-                let os_error = std::io::Error::last_os_error();
-                if !sw_event && os_error.kind() == std::io::ErrorKind::NotFound {
-                    error_context = "Failed to open perf event.\n\
-                                    Try running the profile example with the `--sw-event` option.";
-                }
-                Err(libbpf_rs::Error::from(os_error)).context(error_context)
-            } else {
-                Ok(fd)
+    let mut fds = Vec::new();
+    for cpu in 0..nprocs {
+        let fd = syscall::perf_event_open(&attr, pid, cpu as i32, -1, 0) as i32;
+        if fd == -1 {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ENODEV) => continue, // CPU does not exist
+                Some(libc::ENOENT) if !sw_event => return init_perf_monitor(freq, true),
+                Some(x) => bail!("Failed to open perf event: error {}", x),
+                None => bail!("Failed to open perf event"),
             }
-        })
-        .collect()
+        } else {
+            fds.push(fd);
+        }
+    }
+
+    Ok(fds)
 }
 
 fn attach_perf_event(
@@ -810,8 +810,10 @@ fn set_expression_in_map(map: &mut MapImpl<'_, Mut>, expr_id: u32, expr: &Vec<u8
 fn main() -> Result<()> {
     env_logger::init();
 
-    let pid: u32 = 3961;
+    //let pid: u32 = 463248;
+    //let pid: u32 = 3961;
     let pid: u32 = 1096833;
+
 
     let mut state = ProcessState {
         maps_by_id: HashMap::new(),
@@ -845,7 +847,6 @@ fn main() -> Result<()> {
         entry.push(map.clone());
     }
 
-    println!("maps_by_id: {:?}", state.maps_by_id);
     // find all binaries and build unwind tables
     let mut built_maps = vec![false; next_id as usize];
     for map in maps.iter_mut() {
