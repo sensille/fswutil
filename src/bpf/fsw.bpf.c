@@ -111,7 +111,7 @@ find_mapping(struct mapping *m, uint64_t ip)
 	struct map_entry *me = &m->entries[left];
 	bpf_printk("ip %lx found in mapping %d: %lx", ip, left, me->vma_start);
 	bpf_printk("    obj %d off %lx map %d",
-		me->obj_id_offset >> 48, me->obj_id_offset & 0xffffffffffff, me->offsetmap_id);
+		me->offset >> 48, me->offset & 0xffffffffffff, me->offsetmap_id);
 #ifdef SAFETY_CHECK
 	// safety check
 	if (left + 1 < n) {
@@ -129,6 +129,7 @@ find_mapping(struct mapping *m, uint64_t ip)
 static struct offsetmap_entry *
 find_cft(struct offsetmap *om, uint16_t obj_id, uint64_t offset)
 {
+#if 0
 	uint64_t key = (uint64_t)obj_id << 48 | offset;
 	int i;
 	uint32_t n = om->nentries;
@@ -147,9 +148,9 @@ find_cft(struct offsetmap *om, uint16_t obj_id, uint64_t offset)
 		struct offsetmap_entry *ome = &om->entries[mid];
 
 		DBG("offset bisection step %d: left %d right %d mid %d obj_off %lx",
-			i, left, right, mid, ome->obj_id_offset);
+			i, left, right, mid, ome->offset);
 
-		if (ome->obj_id_offset <= key)
+		if (ome->offset <= key)
 			left = mid + 1;
 		else
 			right = mid;
@@ -166,21 +167,24 @@ find_cft(struct offsetmap *om, uint16_t obj_id, uint64_t offset)
 
 	struct offsetmap_entry *ome = &om->entries[left];
 	bpf_printk("key %lx found in offsets %d: %lx ctf %d",
-		key, left, ome->obj_id_offset);
+		key, left, ome->offset);
 	bpf_printk("    ctf %d", ome->cft_id);
 #ifdef SAFETY_CHECK
 	// safety check
 	if (left + 1 < n) {
 		struct offsetmap_entry *nome = &om->entries[left + 1];
-		if (key >= nome->obj_id_offset) {
+		if (key >= nome->offset) {
 			bpf_printk("BAD: key %lx >= next key %lx, no match",
-				key, nome->obj_id_offset);
+				key, nome->offset);
 			return NULL;
 		}
 	}
 #endif
 
 	return ome;
+#else
+	return NULL;
+#endif
 }
 
 struct fsw_state {
@@ -208,14 +212,15 @@ unwind_step(int ix, struct fsw_state *s) {
 		LOG("offsetmap not found");
 		return 1;
 	}
-	uint64_t offset = s->regs[RIP] - me->vma_start + (me->obj_id_offset & 0xffffffffffff);
+	uint64_t offset = s->regs[RIP] - me->vma_start + (me->offset & 0xffffffffffff);
 	DBG("rip %lx vma_start %lx offset %lx", s->regs[RIP], me->vma_start, offset);
-	struct offsetmap_entry *ome = find_cft(om, me->obj_id_offset >> 48, offset);
+	struct offsetmap_entry *ome = find_cft(om, me->offset >> 48, offset);
 	if (ome == NULL) {
 		LOG("no offsetmap entry found");
 		return 1;
 	}
 
+#if 0
 	struct cft *cf = bpf_map_lookup_elem(&cfts, &ome->cft_id);
 	if (cf == NULL) {
 		LOG("cft not found");
@@ -226,6 +231,9 @@ unwind_step(int ix, struct fsw_state *s) {
 		LOG("no mapping for address");
 		return 1;
 	}
+#else
+	struct cft *cf = NULL;
+#endif
 
 	// XXX only copy when needed, invent a flag in cft
 	u64 old_regs[NUM_REGISTERS];
@@ -309,7 +317,7 @@ unwind_step(int ix, struct fsw_state *s) {
 }
 
 SEC("perf_event")
-int BPF_KPROBE(uprobe_add)
+int BPF_KPROBE(ustack)
 {
 	struct task_struct *task;
 

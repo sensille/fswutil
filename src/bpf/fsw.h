@@ -4,7 +4,7 @@
 #define MAX_MAPPINGS	1000
 #define MAX_MAPPINGS_BISECT_STEPS	10
 
-#define MAX_OFFSETS	130000
+#define OFFSETMAP_SIZE	262144	// 256 KB
 #define MAX_OFFSETS_BISECT_STEPS	17
 
 #define MAX_CFT_ENTRIES	1000
@@ -21,17 +21,14 @@ struct mapping {
 	uint64_t	nentries;
 	struct map_entry {
 		uint64_t	vma_start;
-		uint64_t	obj_id_offset;
+		uint64_t	offset;
 		uint32_t	offsetmap_id;
+		uint32_t	start_in_map;
 	} entries[MAX_MAPPINGS];
 };
 
 struct offsetmap {
-	uint64_t	nentries;
-	struct offsetmap_entry {
-		uint64_t	obj_id_offset;
-		uint32_t	cft_id;
-	} entries[MAX_OFFSETS];
+	uint8_t	map[OFFSETMAP_SIZE];
 };
 
 enum register_rule_type {
