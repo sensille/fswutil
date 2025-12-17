@@ -241,7 +241,8 @@ bpf_printk("offsetmap found, id %d, start %d offset %x", offsetmap_id, start_in_
 
 	while (depth++ < MAX_OFFSETS_BISECT_STEPS) {
 		uint64_t current_key = uw_read_key(ptr, &pos);
-		bpf_printk(" read key %ld abs %lx at pos %d", current_key, current_key + parent_key, pos);
+		DBG(" read key %ld abs %lx at pos %d", current_key,
+			current_key + parent_key, pos);
 		if (current_key == 0) { /* final empty node */
 			return best;
 		}
@@ -262,12 +263,12 @@ bpf_printk("offsetmap found, id %d, start %d offset %x", offsetmap_id, start_in_
 
 		uint32_t rel_ptr = uw_read_rel_ptr(ptr, &pos, &is_leaf);
 		if (search_key < current_key) {
-bpf_printk(" go left at key %lx", current_key);
+			DBG(" go left at key %lx", current_key);
 			/* go to left child */
 			pos += rel_ptr;
 		} else {
 			best = uw_read_value(ptr, &pos);
-bpf_printk(" go right: best %d at key %lx", best, current_key);
+			DBG(" go right: best %d at key %lx", best, current_key);
 			/* continue with right child */
 		}
 	}
@@ -277,15 +278,16 @@ bpf_printk(" go right: best %d at key %lx", best, current_key);
 	/* left key/value */
 	uint64_t left_key = uw_read_key(ptr, &pos);
 	uint64_t left_value = uw_read_value(ptr, &pos);
-bpf_printk(" leaf left key %lx value %d", left_key + parent_key, left_value);
+	DBG(" leaf left key %lx value %d", left_key + parent_key, left_value);
 
 	/* own value */
 	uint64_t own_value = uw_read_value(ptr, &pos);
-bpf_printk(" leaf own value %d", own_value);
+	DBG(" leaf own value %d", own_value);
 
 	if (search_key < parent_key) {
 		if (left_key != 0 && search_key >= (left_key + parent_key)) {
-bpf_printk(" leaf left match: key %lx value %d", left_key + parent_key, left_value);
+			DBG(" leaf left match: key %lx value %d",
+				left_key + parent_key, left_value);
 			return left_value;
 		}
 		return best;
@@ -296,7 +298,8 @@ bpf_printk(" leaf left match: key %lx value %d", left_key + parent_key, left_val
 	uint64_t right_value = uw_read_value(ptr, &pos);
 
 	if (right_key != 0 && search_key >= (right_key + parent_key)) {
-bpf_printk(" leaf right match: key %lx value %d", right_key + parent_key, right_value);
+		DBG(" leaf right match: key %lx value %d",
+			right_key + parent_key, right_value);
 		return right_value;
 	}
 
@@ -467,7 +470,8 @@ int BPF_KPROBE(ustack)
 		return 0;
 	}
 	bpf_printk("mm: %lx", mm);
-	bpf_printk("start stack: %lx", BPF_CORE_READ(mm, start_stack));
+	uint64_t stack_top = BPF_CORE_READ(mm, start_stack);
+	bpf_printk("start stack: %lx", stack_top);
 	/*
 	 * user mode regs are passed in as ctx. We fetch
 	 * them anyway, so that it also works when called from
@@ -531,6 +535,11 @@ int BPF_KPROBE(ustack)
 		if (unwind_step(i, &s) != 0)
 			goto done;
 		out->frames[i] = s.regs[RIP];
+		bpf_printk("frame %d: RIP %lx RSP %lx", i, s.regs[RIP], s.regs[RSP]);
+		if (s.regs[RSP] >= stack_top - 8) {
+			bpf_printk("top of stack reached");
+			goto done;
+		}
 	}
 
 #else
