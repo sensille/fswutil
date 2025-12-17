@@ -72,11 +72,6 @@ static uint32_t __attribute__((optnone)) scramble(uint32_t val) {
         return val ^ 0xFFFFFFFF;
 }
 
-/*
-TODO: see if we need to acutally check return values of uw_read_*, error returns
-TODO: fewer bounds checks if we can convince the verifier
-TODO: find_ctf non-static
-*/
 static struct map_entry *
 find_mapping(struct mapping *m, uint64_t ip)
 {
@@ -149,11 +144,8 @@ static uint64_t
 uw_read_key(uint8_t *ptr, uint32_t *pos)
 {
 	uint64_t key = 0;
-	if (*pos >= OFFSETMAP_SIZE - 9) {
-		LOG("uw_read_key: pos %d out of bounds", *pos);
-		return 0;
-	}
 	uint8_t b = ptr[(*pos)++];
+
 	if (b <= 0xde) {
 		key = (uint64_t)b - 111;
 	} else if (b == 0xdf) {
@@ -176,11 +168,8 @@ static uint32_t
 uw_read_rel_ptr(uint8_t *ptr, uint32_t *pos, int *is_leaf)
 {
 	uint32_t rel_ptr = 0;
-	if (*pos >= OFFSETMAP_SIZE - 3) {
-		LOG("uw_read_rel_ptr: pos %d out of bounds", *pos);
-		return -1;
-	}
 	uint8_t b = ptr[(*pos)++];
+
 	if (b <= 0xcf) {
 		rel_ptr = b;
 		*is_leaf = 0;
@@ -206,11 +195,8 @@ static uint64_t
 uw_read_value(uint8_t *ptr, uint32_t *pos)
 {
 	uint64_t val = 0;
-	if (*pos >= OFFSETMAP_SIZE - 3) {
-		LOG("uw_read_value: pos %d out of bounds", *pos);
-		return -1;
-	}
 	uint8_t b = ptr[(*pos)++];
+
 	if (b <= 0xf7) {
 		val = b;
 	} else {
@@ -229,7 +215,7 @@ find_cft(uint32_t offsetmap_id, uint64_t start_in_map, uint64_t search_key)
 	if (om == NULL) {
 		bpf_printk("offsetmap lookup failed for id %d", offsetmap_id);
 		LOG("offsetmap not found");
-		return 1;
+		return -1;
 	}
 bpf_printk("offsetmap found, id %d, start %d offset %x", offsetmap_id, start_in_map, search_key);
 	uint8_t *ptr = om->map;
@@ -240,6 +226,11 @@ bpf_printk("offsetmap found, id %d, start %d offset %x", offsetmap_id, start_in_
 	int depth = 0;
 
 	while (depth++ < MAX_OFFSETS_BISECT_STEPS) {
+		/* bounds check for loop */
+		if (pos >= OFFSETMAP_SIZE - 15) {
+			LOG("uw_read_key: pos %d out of bounds", *pos);
+			return -1;
+		}
 		uint64_t current_key = uw_read_key(ptr, &pos);
 		DBG(" read key %ld abs %lx at pos %d", current_key,
 			current_key + parent_key, pos);
@@ -273,6 +264,10 @@ bpf_printk("offsetmap found, id %d, start %d offset %x", offsetmap_id, start_in_
 		}
 	}
 
+	if (pos >= OFFSETMAP_SIZE - 15) {
+		LOG("uw_read_key: pos %d out of bounds", *pos);
+		return -1;
+	}
 	/* leaf node case */
 
 	/* left key/value */
@@ -293,6 +288,10 @@ bpf_printk("offsetmap found, id %d, start %d offset %x", offsetmap_id, start_in_
 		return best;
 	}
 
+	if (pos >= OFFSETMAP_SIZE - 15) {
+		LOG("uw_read_key: pos %d out of bounds", *pos);
+		return -1;
+	}
 	/* right key/value */
 	uint64_t right_key = uw_read_key(ptr, &pos);
 	uint64_t right_value = uw_read_value(ptr, &pos);
@@ -331,7 +330,11 @@ unwind_step(int ix, struct fsw_state *s) {
 	int32_t cft_id = find_cft(me->offsetmap_id, me->start_in_map, offset);
 	bpf_printk(" found cft entry id %d", cft_id);
 
-	if (cft_id <= 0) {
+	if (cft_id < 0) {
+		bpf_printk("error in offsetmap processing");
+		return 1;
+	}
+	if (cft_id == 0) {
 		LOG("no offsetmap entry found");
 		return 1;
 	}
@@ -342,10 +345,6 @@ unwind_step(int ix, struct fsw_state *s) {
 		return 1;
 	}
 	bpf_printk("cft %d found", cft_id);
-	if (cft_id == 0) {
-		LOG("no mapping for address");
-		return 1;
-	}
 
 	// XXX only copy when needed, invent a flag in cft
 	u64 old_regs[NUM_REGISTERS];
@@ -400,7 +399,7 @@ unwind_step(int ix, struct fsw_state *s) {
 			u64 val = 0;
 			int ret = bpf_probe_read_user(&val, sizeof(val), (void *)addr);
 			if (ret < 0) {
-				LOG("Stack walk: failed to read r%d at addr %lx, stopping",
+				bpf_printk("Stack walk: failed to read r%d at addr %lx",
 					reg, addr);
 				return 1;
 			}
@@ -409,7 +408,7 @@ unwind_step(int ix, struct fsw_state *s) {
 			s->regs_valid |= (1 << reg);
                 // XXX use old_regs for register to register copy
 		} else {
-			LOG("Stack walk: unsupported register rule type %d for r%d, stopping",
+			bpf_printk("Stack walk: unsupported register rule type %d for r%d",
 				cf->rules[reg].rtype, reg);
 			return 1;
 		}
@@ -546,6 +545,7 @@ int BPF_KPROBE(ustack)
 	bpf_loop(MAX_STACK_FRAMES, unwind_step, &s, 0);
 #endif
 
+	// XXX TODO when unwinding fails, copy out the stack for inspection in user space
 done:
 	out->nframes = s.steps;
 	bpf_ringbuf_submit(out, 0);
