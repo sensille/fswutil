@@ -10,7 +10,7 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 const volatile uint32_t targ_pid = 0;
 
-#define LOG(...) // bpf_printk(__VA_ARGS__)
+#define LOG(...)  //bpf_printk(__VA_ARGS__)
 #define DBG(...) // bpf_printk(__VA_ARGS__)
 #undef SAFETY_CHECK
 #define APPEASE_VERIFIER
@@ -72,6 +72,11 @@ static uint32_t __attribute__((optnone)) scramble(uint32_t val) {
         return val ^ 0xFFFFFFFF;
 }
 
+/*
+TODO: see if we need to acutally check return values of uw_read_*, error returns
+TODO: fewer bounds checks if we can convince the verifier
+TODO: find_ctf non-static
+*/
 static struct map_entry *
 find_mapping(struct mapping *m, uint64_t ip)
 {
@@ -126,65 +131,176 @@ find_mapping(struct mapping *m, uint64_t ip)
 	return me;
 }
 
-static struct offsetmap_entry *
-find_cft(struct offsetmap *om, uint16_t obj_id, uint64_t offset)
+// encoding:
+// ptrs: we limit the table size to 2MB, so 21 bits
+//   00-CF: encode as 1 byte
+//   D0-D8: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
+// leaf ptrs:
+//   D8-DF: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
+//   E0-FF: ptr as 1 byte
+// values:
+//   00-F7: encode as 1 byte
+//   F8-FF: first byte with 3 lower bits of value, followed by 2 bytes (little-endian)
+// RelKey:
+//   00-DE: 1 byte, val + 111
+//   DF   : followed by 8 bytes i64 (little-endian)
+//   E0-FF: lower 5 bits, followed by 1 byte (little-endian)
+static uint64_t
+uw_read_key(uint8_t *ptr, uint32_t *pos)
 {
-#if 0
-	uint64_t key = (uint64_t)obj_id << 48 | offset;
-	int i;
-	uint32_t n = om->nentries;
-	if (n > MAX_OFFSETS)
-		n = MAX_OFFSETS;
-
-	uint32_t left = 0;
-	uint32_t right = n;
-	uint32_t mid = 0;
-	for (i = 0; i < MAX_OFFSETS_BISECT_STEPS && left <= right; ++i) {
-		mid = left + (right - left) / 2;
-		// XXX TODO expensive
-		mid = scramble(scramble(mid));
-		if (mid >= MAX_OFFSETS)
-			break;
-		struct offsetmap_entry *ome = &om->entries[mid];
-
-		DBG("offset bisection step %d: left %d right %d mid %d obj_off %lx",
-			i, left, right, mid, ome->offset);
-
-		if (ome->offset <= key)
-			left = mid + 1;
-		else
-			right = mid;
-
+	uint64_t key = 0;
+	if (*pos >= OFFSETMAP_SIZE - 9) {
+		LOG("uw_read_key: pos %d out of bounds", *pos);
+		return 0;
 	}
-	--left;
-#ifdef APPEASE_VERIFIER
-	left = scramble(scramble(left));
-#endif
-	if (left >= MAX_OFFSETS) {
-		LOG("left %d out of bounds", left);
-		return NULL;
-	}
-
-	struct offsetmap_entry *ome = &om->entries[left];
-	bpf_printk("key %lx found in offsets %d: %lx ctf %d",
-		key, left, ome->offset);
-	bpf_printk("    ctf %d", ome->cft_id);
-#ifdef SAFETY_CHECK
-	// safety check
-	if (left + 1 < n) {
-		struct offsetmap_entry *nome = &om->entries[left + 1];
-		if (key >= nome->offset) {
-			bpf_printk("BAD: key %lx >= next key %lx, no match",
-				key, nome->offset);
-			return NULL;
+	uint8_t b = ptr[(*pos)++];
+	if (b <= 0xde) {
+		key = (uint64_t)b - 111;
+	} else if (b == 0xdf) {
+		/* 8 byte */
+		key = *(uint64_t *)&ptr[*pos];
+		*pos += 8;
+	} else {
+		/* 5 bit + 1 byte */
+		key = ((b & 0x1f) << 8) | ptr[(*pos)++];
+		/* sign extend */
+		if (key & 0x1000) {
+			key |= ~0x1ffful;
 		}
 	}
-#endif
 
-	return ome;
-#else
-	return NULL;
-#endif
+	return key;
+}
+
+static uint32_t
+uw_read_rel_ptr(uint8_t *ptr, uint32_t *pos, int *is_leaf)
+{
+	uint32_t rel_ptr = 0;
+	if (*pos >= OFFSETMAP_SIZE - 3) {
+		LOG("uw_read_rel_ptr: pos %d out of bounds", *pos);
+		return -1;
+	}
+	uint8_t b = ptr[(*pos)++];
+	if (b <= 0xcf) {
+		rel_ptr = b;
+		*is_leaf = 0;
+	} else if (b >= 0xd0 && b <= 0xd8) {
+		/* 3 bit + 2 byte */
+		rel_ptr = ((b & 0x07) << 16) | *(uint16_t *)&ptr[*pos];
+		*pos += 2;
+		*is_leaf = 0;
+	} else if (b >= 0xd8 && b <= 0xdf) {
+		/* leaf ptr: 3 bit + 2 byte */
+		rel_ptr = ((b & 0x07) << 16) | *(uint16_t *)&ptr[*pos];
+		*pos += 2;
+		*is_leaf = 1;
+	} else {
+		/* leaf ptr: 1 byte */
+		rel_ptr = b & 0x1f;
+		*is_leaf = 1;
+	}
+	return rel_ptr;
+}
+
+static uint64_t
+uw_read_value(uint8_t *ptr, uint32_t *pos)
+{
+	uint64_t val = 0;
+	if (*pos >= OFFSETMAP_SIZE - 3) {
+		LOG("uw_read_value: pos %d out of bounds", *pos);
+		return -1;
+	}
+	uint8_t b = ptr[(*pos)++];
+	if (b <= 0xf7) {
+		val = b;
+	} else {
+		/* 3 bit + 2 byte */
+		val = ((b & 0x07) << 8) | *(uint16_t *)&ptr[*pos];
+		*pos += 2;
+	}
+	return val;
+}
+
+// returns entry_id
+int
+find_cft(uint32_t offsetmap_id, uint64_t start_in_map, uint64_t search_key)
+{
+	struct offsetmap *om = bpf_map_lookup_elem(&offsetmaps, &offsetmap_id);
+	if (om == NULL) {
+		bpf_printk("offsetmap lookup failed for id %d", offsetmap_id);
+		LOG("offsetmap not found");
+		return 1;
+	}
+bpf_printk("offsetmap found, id %d, start %d offset %x", offsetmap_id, start_in_map, search_key);
+	uint8_t *ptr = om->map;
+	int is_leaf = 0;
+	uint64_t parent_key = 0;
+	uint32_t pos = start_in_map;
+	int best = -1;
+	int depth = 0;
+
+	while (depth++ < MAX_OFFSETS_BISECT_STEPS) {
+		uint64_t current_key = uw_read_key(ptr, &pos);
+		bpf_printk(" read key %ld abs %lx at pos %d", current_key, current_key + parent_key, pos);
+		if (current_key == 0) { /* final empty node */
+			return best;
+		}
+		current_key += parent_key;
+		current_key = scramble(scramble(current_key)); // XXX
+		parent_key = current_key;
+
+		if (is_leaf) {
+			/* leaf node reached */
+			break;
+		}
+
+		if (!is_leaf && ptr[pos] == 0) {
+			/* unmarked leaf node */
+			++pos;
+			break;
+		}
+
+		uint32_t rel_ptr = uw_read_rel_ptr(ptr, &pos, &is_leaf);
+		if (search_key < current_key) {
+bpf_printk(" go left at key %lx", current_key);
+			/* go to left child */
+			pos += rel_ptr;
+		} else {
+			best = uw_read_value(ptr, &pos);
+bpf_printk(" go right: best %d at key %lx", best, current_key);
+			/* continue with right child */
+		}
+	}
+
+	/* leaf node case */
+
+	/* left key/value */
+	uint64_t left_key = uw_read_key(ptr, &pos);
+	uint64_t left_value = uw_read_value(ptr, &pos);
+bpf_printk(" leaf left key %lx value %d", left_key + parent_key, left_value);
+
+	/* own value */
+	uint64_t own_value = uw_read_value(ptr, &pos);
+bpf_printk(" leaf own value %d", own_value);
+
+	if (search_key < parent_key) {
+		if (left_key != 0 && search_key >= (left_key + parent_key)) {
+bpf_printk(" leaf left match: key %lx value %d", left_key + parent_key, left_value);
+			return left_value;
+		}
+		return best;
+	}
+
+	/* right key/value */
+	uint64_t right_key = uw_read_key(ptr, &pos);
+	uint64_t right_value = uw_read_value(ptr, &pos);
+
+	if (right_key != 0 && search_key >= (right_key + parent_key)) {
+bpf_printk(" leaf right match: key %lx value %d", right_key + parent_key, right_value);
+		return right_value;
+	}
+
+	return own_value;
 }
 
 struct fsw_state {
@@ -207,33 +323,26 @@ unwind_step(int ix, struct fsw_state *s) {
 		return 1;
 	}
 
-	struct offsetmap *om = bpf_map_lookup_elem(&offsetmaps, &me->offsetmap_id);
-	if (om == NULL) {
-		LOG("offsetmap not found");
-		return 1;
-	}
-	uint64_t offset = s->regs[RIP] - me->vma_start + (me->offset & 0xffffffffffff);
+	uint64_t offset = s->regs[RIP] - me->vma_start + me->offset;
 	DBG("rip %lx vma_start %lx offset %lx", s->regs[RIP], me->vma_start, offset);
-	struct offsetmap_entry *ome = find_cft(om, me->offset >> 48, offset);
-	if (ome == NULL) {
+	int32_t cft_id = find_cft(me->offsetmap_id, me->start_in_map, offset);
+	bpf_printk(" found cft entry id %d", cft_id);
+
+	if (cft_id <= 0) {
 		LOG("no offsetmap entry found");
 		return 1;
 	}
 
-#if 0
-	struct cft *cf = bpf_map_lookup_elem(&cfts, &ome->cft_id);
+	struct cft *cf = bpf_map_lookup_elem(&cfts, &cft_id);
 	if (cf == NULL) {
 		LOG("cft not found");
 		return 1;
 	}
-	LOG("cft %d found", ome->cft_id);
-	if (ome->cft_id == 0) {
+	bpf_printk("cft %d found", cft_id);
+	if (cft_id == 0) {
 		LOG("no mapping for address");
 		return 1;
 	}
-#else
-	struct cft *cf = NULL;
-#endif
 
 	// XXX only copy when needed, invent a flag in cft
 	u64 old_regs[NUM_REGISTERS];
@@ -402,7 +511,7 @@ int BPF_KPROBE(ustack)
 	 */
 	struct mapping *m = bpf_map_lookup_elem(&mappings, &tgid);
 	if (m == NULL) {
-		LOG("no mapping found");
+		bpf_printk("no mapping found");
 		return 0;
 	}
 	bpf_printk("nmappings %d", m->nentries);
@@ -415,9 +524,10 @@ int BPF_KPROBE(ustack)
 		LOG("ringbuf reserve failed");
 		return 0;
 	}
+	out->frames[0] = s.regs[RIP];
 #if 1
 	// pre-5.17 without bpf_loop
-	for (int i = 0; i < 20 /*MAX_STACK_FRAMES*/; ++i) {
+	for (int i = 1; i < 25 /*MAX_STACK_FRAMES*/; ++i) {
 		if (unwind_step(i, &s) != 0)
 			goto done;
 		out->frames[i] = s.regs[RIP];
