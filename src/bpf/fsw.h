@@ -60,10 +60,10 @@ enum cfa_rule_type {
 struct cfa_rule {
 	enum cfa_rule_type	rtype;
 	union cfa_rule_data {
-	struct reg_offset {
-		uint32_t	reg;
-		int64_t		offset;
-	} reg_offset;
+		struct reg_offset {
+			uint32_t	reg;
+			int64_t		offset;
+		} reg_offset;
 		uint32_t	expression_id;
 	} data;
 };
@@ -72,13 +72,14 @@ struct cft {
 	uint64_t arg_size; /* 8 bytes */
 	struct cfa_rule cfa; /* 16 bytes */
 	struct register_rule rules[NUM_REGISTERS];	/* 17 * 12 = 204 bytes */
-	/* total: 225 bytes */
+	/* total: 228 bytes */
 };
 
 struct expression {
 	uint8_t ninstructions;
 	uint8_t instructions[MAX_EXPRESSION_LEN];
-};
+ };
+
 
 #pragma pack()
 

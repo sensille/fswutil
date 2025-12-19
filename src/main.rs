@@ -6,9 +6,31 @@ use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::{ MapCore, MapFlags, MapImpl, Mut, RingBufferBuilder };
 use std::default::Default;
 use blazesym::symbolize::source::{ Process, Source };
-use blazesym::symbolize::{ Symbolizer, Symbolized, Input, Sym };
+use blazesym::symbolize::{ Symbolizer, Symbolized, Input };
 use blazesym::Pid;
-use libfsw::{ CfaRule, RegisterRule };
+
+#[allow(non_camel_case_types)]
+pub struct mapping {
+    pub nentries: u64,
+    pub entries: [map_entry; 1000],
+}
+impl Default for mapping {
+    fn default() -> Self {
+        Self {
+            nentries: u64::default(),
+            entries: [map_entry::default(); 1000],
+        }
+    }
+}
+#[derive(Debug, Default, Copy, Clone)]
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct map_entry {
+    pub vma_start: u64,
+    pub offset: u64,
+    pub offsetmap_id: u32,
+    pub start_in_map: u32,
+}
 
 mod fsw {
     include!(concat!(
@@ -93,7 +115,7 @@ fn main() -> Result<()> {
 
     //let pid: u32 = 463248;
     //let pid: u32 = 3961;
-    let pid: u32 = 797877;
+    let pid: u32 = 1339584;
 
     let mut fsw = libfsw::Fsw::new();
 
@@ -128,104 +150,21 @@ fn main() -> Result<()> {
 
     // build offsets tables
     for (i, table) in tables.iter_mut().enumerate() {
-        table.extend(vec![0; 262144 - table.len()]);
         skel.maps.offsetmaps.update(&(i as u32).to_le_bytes(), &table, MapFlags::ANY)?;
     }
 
     // build mappings table
-    let mut m = types::mapping {
-        nentries: mappings.len() as u64,
-        ..Default::default() };
-
-    // returns vec of (vma_start, file-offset, offsetmap_id, start-in-map)
-    for (id, (vma_start, file_offset, map_id, start)) in mappings.iter().enumerate() {
-        println!("mapping {}: vma_start {:#x} file_offset {:#x} map_id {} start_in_map {:#x}",
-            id, *vma_start, *file_offset, *map_id, *start);
-        m.entries[id] = types::map_entry {
-            vma_start: *vma_start,
-            offset: *file_offset,
-            offsetmap_id: *map_id as u32,
-            start_in_map: *start as u32,
-        };
-    }
-    let m_b = unsafe {
-        std::slice::from_raw_parts(
-            (&m as *const types::mapping) as *const u8,
-            std::mem::size_of::<types::mapping>(),
-        )
-    };
-
-    let pid_b = pid.to_le_bytes();
-    skel.maps.mappings.update(&pid_b, &m_b, MapFlags::ANY)?;
+    skel.maps.mappings.update(&(pid as u32).to_le_bytes(), &mappings, MapFlags::ANY)?;
 
     // build CFT table
-    for (cft_id, entry) in entries.iter().enumerate() {
-        let mut m_cft = types::cft {
-            arg_size: entry.saved_args_size,
-            ..Default::default()
-        };
+    for (i, table) in entries.iter().enumerate() {
+        skel.maps.cfts.update(&(i as u32).to_le_bytes(), &table, MapFlags::ANY)?;
+    }
 
-        // cfa
-        match &entry.cfa {
-            CfaRule::Expression(expr) => {
-                m_cft.cfa.rtype = types::cfa_rule_type::CFA_RULE_EXPRESSION;
-                m_cft.cfa.data.expression_id = *expr as u32;
-            }
-            CfaRule::RegisterAndOffset(r, o) => {
-                m_cft.cfa.rtype = types::cfa_rule_type::CFA_RULE_REG_OFFSET;
-                m_cft.cfa.data.reg_offset.reg = *r as u32;
-                m_cft.cfa.data.reg_offset.offset = *o;
-            }
-        }
-        // registers
-        for (reg, rule) in &entry.rules {
-            let reg = reg.0 as usize;
-            match *rule {
-                RegisterRule::SameValue => {
-                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_SAME_VALUE;
-                }
-                RegisterRule::Undefined => {
-                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_UNDEFINED;
-                }
-                RegisterRule::Offset(o) => {
-                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_OFFSET;
-                    m_cft.rules[reg].data.offset = o;
-                }
-                RegisterRule::ValOffset(o) => {
-                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_VAL_OFFSET;
-                    m_cft.rules[reg].data.offset = o;
-                }
-                RegisterRule::Register(r) => {
-                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_REGISTER;
-                    m_cft.rules[reg].data.reg = r.0 as u64;
-                }
-                RegisterRule::Expression(expr) => {
-                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_EXPRESSION;
-                    m_cft.rules[reg].data.expression_id = expr as u32;
-                }
-                RegisterRule::ValExpression(expr) => {
-                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_VAL_EXPRESSION;
-                    m_cft.rules[reg].data.expression_id = expr as u32;
-                }
-                /*
-                RegisterRule::Constant(v) => {
-                    m_cft.rules[reg].rtype = types::register_rule_type::REGISTER_RULE_CONSTANT;
-                    m_cft.rules[reg].data.constant = v;
-                }
-                */
-                _ => {
-                    panic!("architectural register rule {:?} not supported in FSW", *rule);
-                }
-            }
-        }
-        let r_b = unsafe {
-            std::slice::from_raw_parts(
-                (&m_cft as *const types::cft) as *const u8,
-                std::mem::size_of::<types::cft>(),
-            )
-        };
-
-        skel.maps.cfts.update(&(cft_id as u32).to_le_bytes(), &r_b, MapFlags::ANY)?;
+    // build CFT table
+    for (i, table) in expressions.iter().enumerate() {
+        println!("setting expr {} len {}", i, table.len());
+        skel.maps.expressions.update(&(i as u32).to_le_bytes(), &table, MapFlags::ANY)?;
     }
 
     let pefds = init_perf_monitor(7, false)
