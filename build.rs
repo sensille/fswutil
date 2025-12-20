@@ -20,6 +20,7 @@ fn main() {
 
     SkeletonBuilder::new()
         .source(SRC)
+        .obj("fsw.bpf.o")
         .clang_args([
             OsStr::new("-I"),
             vmlinux::include_path_root().join(arch).as_os_str(),

@@ -1,9 +1,8 @@
 use anyhow::{Result, bail, Context};
-//use log::{debug, info, warn};
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
-use libbpf_rs::{ MapCore, MapFlags, MapImpl, Mut, RingBufferBuilder };
+use libbpf_rs::{ MapCore, MapFlags, RingBufferBuilder };
 use std::default::Default;
 use blazesym::symbolize::source::{ Process, Source };
 use blazesym::symbolize::{ Symbolizer, Symbolized, Input };
@@ -22,6 +21,7 @@ impl Default for mapping {
         }
     }
 }
+
 #[derive(Debug, Default, Copy, Clone)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
@@ -88,33 +88,9 @@ fn attach_perf_event(
         .collect()
 }
 
-fn set_expression_in_map(map: &mut MapImpl<'_, Mut>, expr_id: u32, expr: &Vec<u8>) -> Result<()> {
-    if expr.len() > 255 /* XXX hardcoded */ {
-        bail!("expression too long");
-    }
-    let mut e = types::expression {
-        ninstructions: expr.len() as u8,
-        instructions: [0u8; 255],
-    };
-    e.instructions[..expr.len()].copy_from_slice(&expr);
-    let e_b = unsafe {
-        std::slice::from_raw_parts(
-            (&e as *const types::expression) as *const u8,
-            std::mem::size_of::<types::expression>(),
-        )
-    };
-
-    // XXX to_le_bytes is too specific
-    map.update(&expr_id.to_le_bytes(), &e_b, MapFlags::ANY)?;
-
-    Ok(())
-}
-
 fn main() -> Result<()> {
     env_logger::init();
 
-    //let pid: u32 = 463248;
-    //let pid: u32 = 3961;
     let pid: u32 = 1339584;
 
     let mut fsw = libfsw::Fsw::new();
@@ -161,7 +137,7 @@ fn main() -> Result<()> {
         skel.maps.cfts.update(&(i as u32).to_le_bytes(), &table, MapFlags::ANY)?;
     }
 
-    // build CFT table
+    // build expressions table
     for (i, table) in expressions.iter().enumerate() {
         println!("setting expr {} len {}", i, table.len());
         skel.maps.expressions.update(&(i as u32).to_le_bytes(), &table, MapFlags::ANY)?;
@@ -171,36 +147,11 @@ fn main() -> Result<()> {
         .context("failed to initialize perf monitor")?;
     let _links = attach_perf_event(&pefds, &skel.progs.ustack);
 
-    /*
-            /* Attach tracepoint handler */
-        //fsw_opts.func_name = "_ZN12PrimaryLogPG7do_readEPNS_9OpContextER5OSDOp";
-        fsw_opts.func_name = "_ZN12PrimaryLogPG10do_osd_opsEPNS_9OpContextERSt6vectorI5OSDOpSaIS3_EE";
-        fsw_opts.retprobe = false;
-        /* fsw/uretprobe expects relative offset of the function to attach
-         * to. libbpf will automatically find the offset for us if we provide the
-         * function name. If the function name is not specified, libbpf will try
-         * to use the function offset instead.
-         */
-        char *probe;
-        asprintf(&probe, "/proc/%d/root/usr/bin/ceph-osd", pid);
-        skel->links.ustack = bpf_program__attach_uprobe_opts(skel->progs.ustack,
-                                                                 pid /* self pid */,
-                                                                 probe,
-                                                                 0 /* offset for function */,
-                                                                 &fsw_opts /* opts */);
-        if (!skel->links.ustack) {
-                err = -errno;
-                fprintf(stderr, "Failed to attach fsw: %d\n", err);
-                goto cleanup;
-        }
-        */
-
     skel.attach()
         .context("failed to attach FSW skel")?;
 
     println!("FSW attached, sleeping...");
 
-    //let symbolizers: HashMap<u64, symbolize::Symbolizer> = HashMap::new();
     let src = Source::Process(Process::new(Pid::from(pid)));
     let symbolizer = Symbolizer::new();
 
@@ -218,24 +169,6 @@ fn main() -> Result<()> {
                 println!("nframes {}", data.nframes);
                 for i in 0..data.nframes as usize {
                     let ip = data.frames[i];
-                    //println!("frame {}: {:#x}", i, ip);
-                    // translate address to mapping and offset
-                    // find map
-                    /*
-                    let key = ProcessMaps {
-                        vm_start: ip,
-                        ..Default::default()
-                    };
-                    let map = state.maps.range(..=key).next_back();
-                    let Some(map) = map else {
-                        println!("  {:#x} no mapping found", ip);
-                        continue;
-                    };
-                    */
-                    /*
-                    println!("  {:#x} mapped to obj_id {} offset {:#x} in {}",
-                        ip, map.obj_id, map.offset + (ip - map.vm_start), map.pathname);
-                    */
                     let sym = symbolizer.symbolize_single(&src, Input::AbsAddr(ip));
                     let s = match sym {
                         Ok(Symbolized::Sym(s)) => s.name.to_string(),
@@ -246,19 +179,6 @@ fn main() -> Result<()> {
                         }
                     };
                     println!("   {:#x} {}", ip, s);
-                    /*
-                    let symbolizer = match symbolizers.get(&map.obj_id) {
-                        Some(s) => s,
-                        None => {
-                            let src = symbolize::source::Source::Process(Proformat!("/proc/{}/root{}",
-                                    state.pid, map.pathname));
-                            let symbolizer = symbolize::Symbolizer::new();
-                                format!("/proc/{}/root{}", state.pid, map.pathname)
-                            ).context("failed to create symbolizer")?;
-                            continue;
-                        }
-                    };
-                    */
                 }
                 1
         })
